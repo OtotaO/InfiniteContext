@@ -80,6 +80,25 @@ export class VectorStore {
   }
 
   /**
+   * Create a defensive copy of a chunk so callers cannot mutate the store's
+   * internal state through returned chunk references.
+   */
+  private cloneChunk(chunk: Chunk): Chunk {
+    return {
+      ...chunk,
+      embedding: [...chunk.embedding],
+      metadata: {
+        ...chunk.metadata,
+        tags: [...chunk.metadata.tags],
+      },
+      summaries: chunk.summaries.map(summary => ({
+        ...summary,
+        concepts: [...summary.concepts],
+      })),
+    };
+  }
+
+  /**
    * Add a chunk to the vector store
    * 
    * @param chunk - The chunk to add
@@ -88,12 +107,14 @@ export class VectorStore {
   public addChunk(chunk: Chunk): number {
     this.validateDimension(chunk.embedding, 'Chunk embedding');
 
+    const storedChunk = this.cloneChunk(chunk);
+
     // Make sure the embedding is normalized if using cosine similarity
     if (this.metric === 'cosine') {
-      chunk.embedding = this.normalizeVector([...chunk.embedding]);
+      storedChunk.embedding = this.normalizeVector(storedChunk.embedding);
     }
     
-    this.chunks.push(chunk);
+    this.chunks.push(storedChunk);
     this.dirty = true;
     return this.chunks.length - 1;
   }
@@ -106,6 +127,18 @@ export class VectorStore {
    */
   public addChunks(chunks: Chunk[]): number[] {
     return chunks.map(chunk => this.addChunk(chunk));
+  }
+
+  /**
+   * Get every chunk in insertion order.
+   *
+   * Returned chunks are defensive copies, so mutating them will not affect the
+   * chunks held by this vector store.
+   *
+   * @returns A copy of all stored chunks
+   */
+  public getAllChunks(): Chunk[] {
+    return this.chunks.map(chunk => this.cloneChunk(chunk));
   }
 
   /**

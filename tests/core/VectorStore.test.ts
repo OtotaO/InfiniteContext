@@ -59,6 +59,25 @@ describe('VectorStore', () => {
     });
   });
 
+  describe('getAllChunks', () => {
+    it('should return all chunks as defensive copies', () => {
+      const chunk1 = createTestChunk(dimension, [1, 0, 0, 0, 0]);
+      const chunk2 = createTestChunk(dimension, [0, 1, 0, 0, 0]);
+      vectorStore.addChunks([chunk1, chunk2]);
+
+      const chunks = vectorStore.getAllChunks();
+      chunks[0].content = 'Mutated content';
+      chunks[0].metadata.tags.push('mutated');
+
+      const freshChunks = vectorStore.getAllChunks();
+
+      expect(chunks).toHaveLength(2);
+      expect(chunks.map(chunk => chunk.id)).toEqual([chunk1.id, chunk2.id]);
+      expect(freshChunks[0].content).toBe('Test content');
+      expect(freshChunks[0].metadata.tags).toEqual(['test']);
+    });
+  });
+
   describe('search', () => {
     beforeEach(() => {
       // Add some test chunks with known embeddings
