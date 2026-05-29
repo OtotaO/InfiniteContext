@@ -56,7 +56,10 @@ export class MemoryManager {
   } = {}): Promise<void> {
     // Set up default storage provider (local filesystem)
     const localStoragePath = options.localStoragePath || path.join(this.basePath, 'storage');
-    const localProvider = new LocalStorageProvider('local', 'Local Storage', localStoragePath);
+    const localProvider = new LocalStorageProvider(localStoragePath, {
+      id: 'local',
+      name: 'Local Storage',
+    });
     await localProvider.connect();
     this.addStorageProvider(localProvider);
   }

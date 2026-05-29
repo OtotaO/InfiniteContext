@@ -842,19 +842,21 @@ Storage provider that uses the local filesystem.
 
 ```typescript
 constructor(
-  id: string = 'local',
-  name: string = 'Local Filesystem',
   basePath: string,
-  maxSizeBytes: number = 5 * 1024 * 1024 * 1024 // 5 GB
+  options?: {
+    id?: string;
+    name?: string;
+    maxSizeBytes?: number;
+  }
 )
 ```
 
 Creates a new LocalStorageProvider instance:
 
-- `id`: The unique ID of this provider (default: `'local'`)
-- `name`: The name of this provider (default: `'Local Filesystem'`)
 - `basePath`: The base path to store data in
-- `maxSizeBytes`: The maximum size in bytes this provider can store (default: `5 GB`)
+- `options.id`: The unique ID of this provider (default: `'local'`)
+- `options.name`: The name of this provider (default: `'Local Filesystem'`)
+- `options.maxSizeBytes`: The maximum size in bytes this provider can store (default: `5 GB`)
 
 ### GoogleDriveProvider
 
@@ -864,24 +866,26 @@ Storage provider that uses Google Drive.
 
 ```typescript
 constructor(
-  id: string = 'gdrive',
-  name: string = 'Google Drive',
   credentials: {
     clientId: string;
     clientSecret: string;
     redirectUri: string;
     refreshToken: string;
   },
-  folderId?: string
+  options?: {
+    id?: string;
+    name?: string;
+    folderId?: string;
+  }
 )
 ```
 
 Creates a new GoogleDriveProvider instance:
 
-- `id`: The unique ID of this provider (default: `'gdrive'`)
-- `name`: The name of this provider (default: `'Google Drive'`)
 - `credentials`: OAuth credentials for Google Drive
-- `folderId`: The ID of the folder to store data in (will create one if not provided)
+- `options.id`: The unique ID of this provider (default: `'gdrive'`)
+- `options.name`: The name of this provider (default: `'Google Drive'`)
+- `options.folderId`: The ID of the folder to store data in (will create one if not provided)
 
 ## Summarization
 

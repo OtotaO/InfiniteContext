@@ -4,6 +4,19 @@ import { v4 as uuidv4 } from 'uuid';
 import { ChunkLocation, StorageQuota, StorageTier } from '../core/types.js';
 import { StorageProvider } from './StorageProvider.js';
 
+export interface GoogleDriveCredentials {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+  refreshToken: string;
+}
+
+export interface GoogleDriveProviderOptions {
+  id?: string;
+  name?: string;
+  folderId?: string;
+}
+
 /**
  * Storage provider that uses Google Drive.
  * 
@@ -14,38 +27,21 @@ export class GoogleDriveProvider implements StorageProvider {
   private id: string;
   private name: string;
   private folderId?: string;
-  private credentials: {
-    clientId: string;
-    clientSecret: string;
-    redirectUri: string;
-    refreshToken: string;
-  };
+  private credentials: GoogleDriveCredentials;
   private drive: any; // Google Drive API client
   private connected: boolean = false;
 
   /**
    * Create a new GoogleDriveProvider
    * 
-   * @param id - The unique ID of this provider
-   * @param name - The name of this provider
    * @param credentials - OAuth credentials for Google Drive
-   * @param folderId - The ID of the folder to store data in (will create one if not provided)
+   * @param options - Optional provider settings
    */
-  constructor(
-    id: string = 'gdrive',
-    name: string = 'Google Drive',
-    credentials: {
-      clientId: string;
-      clientSecret: string;
-      redirectUri: string;
-      refreshToken: string;
-    },
-    folderId?: string
-  ) {
-    this.id = id;
-    this.name = name;
+  constructor(credentials: GoogleDriveCredentials, options: GoogleDriveProviderOptions = {}) {
+    this.id = options.id ?? 'gdrive';
+    this.name = options.name ?? 'Google Drive';
     this.credentials = credentials;
-    this.folderId = folderId;
+    this.folderId = options.folderId;
   }
 
   /**
