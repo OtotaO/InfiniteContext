@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { Bucket } from './Bucket.js';
-import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, HierarchicalSearchResponse, Metadata, SearchResult, StorageTier, Vector } from './types.js';
+import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, HierarchicalSearchResponse, Metadata, SearchResult, StorageTier, UserProfileMemory, UserProfileMemoryField, UserProfileMemoryFieldCategory, UserProfilePrivacySettings, UserProfileSnippet, Vector } from './types.js';
 import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
@@ -49,6 +49,13 @@ export class MemoryManager {
   private storageProviders: Map<string, StorageProvider> = new Map();
   private chunkLocations: Map<string, ChunkLocation> = new Map();
   private unhealthyChunkLocations: Map<string, { location: ChunkLocation; reason: string }> = new Map();
+  private profileMemories: Map<string, UserProfileMemory> = new Map();
+  private profileLocations: Map<string, ChunkLocation> = new Map();
+  private profilePrivacy: UserProfilePrivacySettings = {
+    enabled: true,
+    disabledFields: [],
+    disabledFieldKeys: [],
+  };
   private embeddingFunction?: (text: string) => Promise<Vector>;
   private basePath: string;
   private manifestPath: string;
@@ -229,6 +236,209 @@ export class MemoryManager {
    */
   public getBuckets(): Map<string, Bucket> {
     return new Map(this.rootBuckets);
+  }
+
+
+  /**
+   * Store a user profile memory separately from normal chunks.
+   *
+   * Profile memories are not added to bucket vector stores; they are persisted
+   * with profile-specific metadata and linked back to source episodes/traces.
+   */
+  public async storeUserProfileMemory(
+    profile: UserProfileMemory,
+    preferredTier: StorageTier = StorageTier.LOCAL
+  ): Promise<ChunkLocation | undefined> {
+    if (!this.profilePrivacy.enabled) {
+      return undefined;
+    }
+
+    const filteredProfile = this.applyProfilePrivacy(profile);
+    if (this.countProfileFields(filteredProfile) === 0) {
+      return undefined;
+    }
+
+    this.profileMemories.set(filteredProfile.id, filteredProfile);
+
+    const providers = Array.from(this.storageProviders.values())
+      .sort((a, b) => {
+        if (a.getTier() === preferredTier && b.getTier() !== preferredTier) {
+          return -1;
+        }
+        if (a.getTier() !== preferredTier && b.getTier() === preferredTier) {
+          return 1;
+        }
+        return a.getTier() - b.getTier();
+      });
+
+    const serializedProfile = Buffer.from(JSON.stringify(filteredProfile));
+    for (const provider of providers) {
+      if (!(await provider.isConnected())) {
+        continue;
+      }
+
+      const quota = await provider.getQuota();
+      if (quota.available < serializedProfile.length) {
+        continue;
+      }
+
+      const location = await provider.store(serializedProfile, {
+        type: 'user-profile-memory',
+        id: filteredProfile.id,
+        userId: filteredProfile.userId,
+        sourceEpisodeIds: filteredProfile.sourceEpisodeIds,
+        traceIds: filteredProfile.traceIds,
+        updatedAt: filteredProfile.updatedAt,
+      });
+      this.profileLocations.set(filteredProfile.id, location);
+      return location;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Inspect stored profile memories after applying current privacy settings.
+   */
+  public getUserProfileMemories(userId?: string): UserProfileMemory[] {
+    return Array.from(this.profileMemories.values())
+      .filter(profile => !userId || profile.userId === userId)
+      .map(profile => this.applyProfilePrivacy(profile));
+  }
+
+  /**
+   * Delete one profile memory or all profile memories for a user.
+   */
+  public async deleteUserProfileMemory(options: { profileId?: string; userId?: string } = {}): Promise<number> {
+    const profiles = Array.from(this.profileMemories.values())
+      .filter(profile => (!options.profileId || profile.id === options.profileId) &&
+        (!options.userId || profile.userId === options.userId));
+
+    let deleted = 0;
+    for (const profile of profiles) {
+      const location = this.profileLocations.get(profile.id);
+      if (location) {
+        const provider = this.storageProviders.get(location.providerId);
+        await provider?.delete(location);
+        this.profileLocations.delete(profile.id);
+      }
+      if (this.profileMemories.delete(profile.id)) {
+        deleted += 1;
+      }
+    }
+
+    return deleted;
+  }
+
+  public setProfilePrivacy(settings: Partial<UserProfilePrivacySettings>): UserProfilePrivacySettings {
+    this.profilePrivacy = {
+      ...this.profilePrivacy,
+      ...settings,
+      disabledFields: settings.disabledFields || this.profilePrivacy.disabledFields,
+      disabledFieldKeys: settings.disabledFieldKeys || this.profilePrivacy.disabledFieldKeys,
+    };
+
+    return this.getProfilePrivacy();
+  }
+
+  public getProfilePrivacy(): UserProfilePrivacySettings {
+    return {
+      enabled: this.profilePrivacy.enabled,
+      disabledFields: [...this.profilePrivacy.disabledFields],
+      disabledFieldKeys: [...this.profilePrivacy.disabledFieldKeys],
+    };
+  }
+
+  public getRelevantProfileSnippets(query: string, options: {
+    userId?: string;
+    maxSnippets?: number;
+    minConfidence?: number;
+  } = {}): UserProfileSnippet[] {
+    if (!this.profilePrivacy.enabled) {
+      return [];
+    }
+
+    const queryTerms = new Set(query.toLowerCase().split(/\W+/).filter(term => term.length > 2));
+    const maxSnippets = options.maxSnippets || 5;
+    const minConfidence = options.minConfidence ?? 0.5;
+
+    const snippets = this.getUserProfileMemories(options.userId)
+      .flatMap(profile => this.flattenProfileFields(profile).map(field => ({ profile, field })))
+      .filter(({ field }) => field.confidence >= minConfidence)
+      .map(({ profile, field }) => ({
+        snippet: {
+          profileId: profile.id,
+          category: field.category,
+          key: field.key,
+          value: field.value,
+          confidence: field.confidence,
+          sourceEpisodeIds: field.sourceEpisodeIds,
+          traceIds: field.traceIds,
+          updatedAt: field.updatedAt,
+        } as UserProfileSnippet,
+        score: this.scoreProfileField(field, queryTerms),
+      }))
+      .filter(({ score }) => score > 0 || queryTerms.size === 0);
+
+    snippets.sort((a, b) => b.score - a.score || b.snippet.confidence - a.snippet.confidence);
+    return snippets.slice(0, maxSnippets).map(({ snippet }) => snippet);
+  }
+
+  private flattenProfileFields(profile: UserProfileMemory): UserProfileMemoryField[] {
+    return [
+      ...profile.preferences,
+      ...profile.interests,
+      ...profile.emotionalState,
+      ...profile.behavioralPatterns,
+    ];
+  }
+
+  private countProfileFields(profile: UserProfileMemory): number {
+    return this.flattenProfileFields(profile).length;
+  }
+
+  private applyProfilePrivacy(profile: UserProfileMemory): UserProfileMemory {
+    const filterFields = (fields: UserProfileMemoryField[], category: UserProfileMemoryFieldCategory): UserProfileMemoryField[] => {
+      if (this.profilePrivacy.disabledFields.includes(category)) {
+        return [];
+      }
+      return fields.filter(field => {
+        const fieldKey = `${category}.${field.key}`;
+        return !this.profilePrivacy.disabledFieldKeys.includes(field.key) &&
+          !this.profilePrivacy.disabledFieldKeys.includes(fieldKey);
+      });
+    };
+
+    const filteredProfile: UserProfileMemory = {
+      ...profile,
+      preferences: filterFields(profile.preferences, 'preferences'),
+      interests: filterFields(profile.interests, 'interests'),
+      emotionalState: filterFields(profile.emotionalState, 'emotionalState'),
+      behavioralPatterns: filterFields(profile.behavioralPatterns, 'behavioralPatterns'),
+    };
+
+    const fields = this.flattenProfileFields(filteredProfile);
+    filteredProfile.confidence = fields.length === 0
+      ? 0
+      : fields.reduce((sum, field) => sum + field.confidence, 0) / fields.length;
+
+    return filteredProfile;
+  }
+
+  private scoreProfileField(field: UserProfileMemoryField, queryTerms: Set<string>): number {
+    if (queryTerms.size === 0) {
+      return field.confidence;
+    }
+
+    const searchable = `${field.category} ${field.key} ${field.value}`.toLowerCase();
+    let matches = 0;
+    for (const term of queryTerms) {
+      if (searchable.includes(term)) {
+        matches += 1;
+      }
+    }
+
+    return matches / queryTerms.size + field.confidence * 0.1;
   }
 
   /**

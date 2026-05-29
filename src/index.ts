@@ -10,6 +10,7 @@ export { MemoryManager } from './core/MemoryManager.js';
 export { Bucket } from './core/Bucket.js';
 export { VectorStore } from './core/VectorStore.js';
 export { HierarchicalRetriever, type HierarchicalRetrieverOptions } from './core/HierarchicalRetriever.js';
+export { ProfileMemoryExtractor, type ProfileMemoryExtractorOptions, type ProfileExtractionInput } from './core/ProfileMemoryExtractor.js';
 export { MemoryMonitor, type MemoryAlert } from './core/MemoryMonitor.js';
 export { DeterministicMemoryExtractor, extractedMemoryJsonSchema } from './core/MemoryExtractor.js';
 export * from './core/types.js';
@@ -45,8 +46,9 @@ import { MemoryManager } from './core/MemoryManager.js';
 import { Bucket } from './core/Bucket.js';
 import { SummarizationEngine } from './summarization/SummarizationEngine.js';
 import { GoogleDriveProvider } from './providers/GoogleDriveProvider.js';
-import { Chunk, ChunkLocation, ExtractedMemory, MemoryExtractor, MemoryFeedback, Metadata, StorageTier, Vector } from './core/types.js';
+import { Chunk, ChunkLocation, ExtractedMemory, MemoryExtractor, MemoryFeedback, Metadata, StorageTier, UserProfileMemory, UserProfilePrivacySettings, UserProfileSnippet, Vector } from './core/types.js';
 import { DeterministicMemoryExtractor } from './core/MemoryExtractor.js';
+import { ProfileMemoryExtractor } from './core/ProfileMemoryExtractor.js';
 import { PromptCategorizer } from './categorization/PromptCategorizer.js';
 
 /**
@@ -58,6 +60,7 @@ export class InfiniteContext {
   private promptCategorizer?: PromptCategorizer;
   private embeddingFunction?: (text: string) => Promise<Vector>;
   private memoryExtractor: MemoryExtractor;
+  private profileExtractor: ProfileMemoryExtractor;
   private embeddingModel?: any;
   private llmModel?: any;
 
@@ -77,6 +80,7 @@ export class InfiniteContext {
       cacheExpiration?: number;
       enableLearning?: boolean;
     };
+    profileMemory?: Partial<UserProfilePrivacySettings>;
     googleDriveCredentials?: {
       clientId: string;
       clientSecret: string;
@@ -115,6 +119,10 @@ export class InfiniteContext {
 
     // Create the summarization engine
     this.summarizationEngine = new SummarizationEngine(options.openai);
+
+    // Create the profile memory extractor for durable user-profile extraction.
+    this.profileExtractor = new ProfileMemoryExtractor({ profilePrivacy: options.profileMemory });
+    this.memoryManager.setProfilePrivacy(this.profileExtractor.getProfilePrivacy());
   }
 
   /**
@@ -205,6 +213,10 @@ export class InfiniteContext {
       metadata?: Partial<Omit<Metadata, 'id' | 'timestamp'>>;
       summarize?: boolean;
       preferredTier?: StorageTier;
+      extractProfile?: boolean;
+      userId?: string;
+      episodeId?: string;
+      traceId?: string;
     } = {}
   ): Promise<string> {
     const bucketName = options.bucketName || 'default';
@@ -212,6 +224,7 @@ export class InfiniteContext {
     const metadata = options.metadata || {};
     const summarize = options.summarize !== false;
     const preferredTier = options.preferredTier || StorageTier.LOCAL;
+    const extractProfile = options.extractProfile === true;
 
     // Find or create the bucket
     const buckets = this.memoryManager.getBuckets();
@@ -234,11 +247,36 @@ export class InfiniteContext {
       ...metadata,
     }, summarize);
 
+    const traceId = options.traceId || (metadata.traceId as string | undefined);
+    let profile: UserProfileMemory | null = null;
+
+    if (extractProfile) {
+      profile = this.profileExtractor.extractProfileMemory({
+        content,
+        userId: options.userId,
+        episodeId: options.episodeId || chunk.id,
+        traceId,
+        timestamp: chunk.metadata.timestamp,
+      });
+
+      if (profile) {
+        chunk.metadata.profileMemoryIds = [profile.id];
+        chunk.metadata.episodeId = options.episodeId || chunk.id;
+        if (traceId) {
+          chunk.metadata.traceId = traceId;
+        }
+      }
+    }
+
     // Add the chunk to the bucket
     bucket.addChunk(chunk);
 
     // Store the chunk in the appropriate storage provider
     await this.memoryManager.storeChunk(chunk, preferredTier);
+
+    if (profile) {
+      await this.memoryManager.storeUserProfileMemory(profile, preferredTier);
+    }
 
     return chunk.id;
   }
@@ -259,13 +297,22 @@ export class InfiniteContext {
       minScore?: number;
       retrievalMode?: 'flat' | 'hierarchical';
       hierarchicalOptions?: import('./core/HierarchicalRetriever.js').HierarchicalRetrieverOptions;
+      includeProfiles?: boolean;
+      userId?: string;
+      maxProfileSnippets?: number;
     } = {}
-  ): Promise<Array<{ chunk: Chunk, score: number }>> {
+  ): Promise<Array<{ chunk: Chunk, score: number, profileSnippets?: UserProfileSnippet[] }>> {
     const bucketName = options.bucketName;
     const bucketDomain = options.bucketDomain;
     const maxResults = options.maxResults || 10;
     const minScore = options.minScore || 0.7;
     const retrievalMode = options.retrievalMode || 'flat';
+    const profileSnippets = options.includeProfiles
+      ? this.memoryManager.getRelevantProfileSnippets(query, {
+          userId: options.userId,
+          maxSnippets: options.maxProfileSnippets,
+        })
+      : undefined;
 
     // Find relevant buckets
     let searchResults: Array<{ chunk: Chunk, score: number }> = [];
@@ -306,6 +353,10 @@ export class InfiniteContext {
     // Filter by minimum score
     searchResults = searchResults.filter(result => result.score >= minScore);
 
+    if (profileSnippets && profileSnippets.length > 0) {
+      return searchResults.map(result => ({ ...result, profileSnippets }));
+    }
+
     return searchResults;
   }
 
@@ -331,6 +382,41 @@ export class InfiniteContext {
   }
 
   /**
+   * Assemble retrieval results and profile snippets for agent prompts.
+   */
+  public async assembleAgentContext(
+    query: string,
+    options: {
+      bucketName?: string;
+      bucketDomain?: string;
+      maxResults?: number;
+      minScore?: number;
+      userId?: string;
+      maxProfileSnippets?: number;
+    } = {}
+  ): Promise<{
+    contentResults: Array<{ chunk: Chunk, score: number }>;
+    profileSnippets: UserProfileSnippet[];
+  }> {
+    const contentResults = await this.retrieveContent(query, {
+      bucketName: options.bucketName,
+      bucketDomain: options.bucketDomain,
+      maxResults: options.maxResults,
+      minScore: options.minScore,
+    });
+
+    const profileSnippets = this.memoryManager.getRelevantProfileSnippets(query, {
+      userId: options.userId,
+      maxSnippets: options.maxProfileSnippets,
+    });
+
+    return {
+      contentResults,
+      profileSnippets,
+    };
+  }
+
+  /**
    * Summarize a piece of text
    *
    * @param text - The text to summarize
@@ -348,6 +434,36 @@ export class InfiniteContext {
     const summaries = await this.summarizationEngine.summarize(text, levels);
 
     return summaries.map(summary => summary.content);
+  }
+
+
+  /**
+   * Inspect stored profile memories.
+   */
+  public getUserProfileMemories(userId?: string): UserProfileMemory[] {
+    return this.memoryManager.getUserProfileMemories(userId);
+  }
+
+  /**
+   * Delete one profile memory or all profile memories for a user.
+   */
+  public async deleteUserProfileMemory(options: { profileId?: string; userId?: string } = {}): Promise<number> {
+    return this.memoryManager.deleteUserProfileMemory(options);
+  }
+
+  /**
+   * Update profile memory privacy settings, including disabling storage.
+   */
+  public setProfilePrivacy(settings: Partial<UserProfilePrivacySettings>): UserProfilePrivacySettings {
+    const extractorSettings = this.profileExtractor.setProfilePrivacy(settings);
+    return this.memoryManager.setProfilePrivacy(extractorSettings);
+  }
+
+  /**
+   * Read current profile memory privacy settings.
+   */
+  public getProfilePrivacy(): UserProfilePrivacySettings {
+    return this.memoryManager.getProfilePrivacy();
   }
 
   /**
@@ -599,6 +715,10 @@ export class InfiniteContext {
       metadata?: Partial<Omit<Metadata, 'id' | 'timestamp'>>;
       summarize?: boolean;
       preferredTier?: StorageTier;
+      extractProfile?: boolean;
+      userId?: string;
+      episodeId?: string;
+      traceId?: string;
       overrideBucket?: { name: string, domain: string };
     } = {}
   ): Promise<string> {

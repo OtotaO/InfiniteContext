@@ -168,3 +168,58 @@ export interface BucketConfig {
   description?: string;
   parentId?: string;
 }
+
+/**
+ * Categories of long-lived user profile memory that can be extracted from episodes.
+ */
+export type UserProfileMemoryFieldCategory =
+  | 'preferences'
+  | 'interests'
+  | 'emotionalState'
+  | 'behavioralPatterns';
+
+export interface UserProfileMemoryField {
+  id: string;
+  category: UserProfileMemoryFieldCategory;
+  key: string;
+  value: string;
+  evidence?: string;
+  confidence: number;
+  sourceEpisodeIds: string[];
+  traceIds: string[];
+  createdAt: string;
+  updatedAt: string;
+  lastObservedAt: string;
+}
+
+export interface UserProfileMemory {
+  id: string;
+  userId?: string;
+  preferences: UserProfileMemoryField[];
+  interests: UserProfileMemoryField[];
+  emotionalState: UserProfileMemoryField[];
+  behavioralPatterns: UserProfileMemoryField[];
+  sourceEpisodeIds: string[];
+  traceIds: string[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+  lastObservedAt: string;
+}
+
+export interface UserProfilePrivacySettings {
+  enabled: boolean;
+  disabledFields: UserProfileMemoryFieldCategory[];
+  disabledFieldKeys: string[];
+}
+
+export interface UserProfileSnippet {
+  profileId: string;
+  category: UserProfileMemoryFieldCategory;
+  key: string;
+  value: string;
+  confidence: number;
+  sourceEpisodeIds: string[];
+  traceIds: string[];
+  updatedAt: string;
+}
