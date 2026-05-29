@@ -45,7 +45,7 @@ export class VectorStore {
   /**
    * Calculate the distance between two vectors based on the metric
    */
-  private calculateDistance(a: Vector, b: Vector): number {
+  public calculateSimilarity(a: Vector, b: Vector): number {
     if (a.length !== b.length) {
       throw new Error('Vectors must have the same dimension');
     }
@@ -79,6 +79,10 @@ export class VectorStore {
    */
   public addChunk(chunk: Chunk): number {
     // Make sure the embedding is normalized if using cosine similarity
+    if (chunk.embedding.length !== this.dimension) {
+      throw new Error(`Chunk embedding dimension ${chunk.embedding.length} does not match store dimension ${this.dimension}`);
+    }
+
     if (this.metric === 'cosine') {
       chunk.embedding = this.normalizeVector([...chunk.embedding]);
     }
@@ -113,7 +117,7 @@ export class VectorStore {
     // Calculate distances
     const results = this.chunks.map((chunk, id) => ({
       chunk,
-      score: this.calculateDistance(queryVector, chunk.embedding),
+      score: this.calculateSimilarity(queryVector, chunk.embedding),
       id
     }));
 
@@ -122,6 +126,24 @@ export class VectorStore {
 
     // Return top k results
     return results.slice(0, k).map(({ chunk, score }) => ({ chunk, score }));
+  }
+
+
+  /**
+   * Search and include how many stored vectors were evaluated.
+   */
+  public searchWithStats(queryVector: Vector, k: number = 10): { results: SearchResult[]; candidatesScanned: number } {
+    return {
+      results: this.search(queryVector, k),
+      candidatesScanned: this.chunks.length
+    };
+  }
+
+  /**
+   * Return a snapshot of all chunks in insertion order.
+   */
+  public getChunks(): Chunk[] {
+    return [...this.chunks];
   }
 
   /**
