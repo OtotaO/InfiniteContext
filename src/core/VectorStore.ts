@@ -45,6 +45,14 @@ export class VectorStore {
   /**
    * Calculate the distance between two vectors based on the metric
    */
+  private validateDimension(vector: Vector, label: string): void {
+    if (vector.length !== this.dimension) {
+      throw new Error(
+        `${label} dimension mismatch: expected ${this.dimension}, received ${vector.length}`
+      );
+    }
+  }
+
   private calculateDistance(a: Vector, b: Vector): number {
     if (a.length !== b.length) {
       throw new Error('Vectors must have the same dimension');
@@ -78,6 +86,8 @@ export class VectorStore {
    * @returns The internal ID assigned to the chunk
    */
   public addChunk(chunk: Chunk): number {
+    this.validateDimension(chunk.embedding, 'Chunk embedding');
+
     // Make sure the embedding is normalized if using cosine similarity
     if (this.metric === 'cosine') {
       chunk.embedding = this.normalizeVector([...chunk.embedding]);
@@ -109,6 +119,8 @@ export class VectorStore {
     if (this.chunks.length === 0) {
       return [];
     }
+
+    this.validateDimension(queryVector, 'Query vector');
 
     // Calculate distances
     const results = this.chunks.map((chunk, id) => ({
