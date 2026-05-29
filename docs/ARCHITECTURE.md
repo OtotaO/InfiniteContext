@@ -53,7 +53,7 @@ The Vector Store is responsible for storing and retrieving vectors efficiently. 
 - Supports different distance metrics (cosine, euclidean, dot product)
 - Handles persistence of vectors to disk
 
-The current implementation uses a simple in-memory approach, but it can be extended to use more sophisticated algorithms like HNSW (Hierarchical Navigable Small World) for larger datasets.
+The current implementation uses exact in-memory search with persisted flat index artifacts. Approximate algorithms such as HNSW (Hierarchical Navigable Small World) or IVF are not supported in the first functional release; those backends must be wired through rebuild, merge, split, save, and load paths before users can rely on them.
 
 ### Storage Providers
 
