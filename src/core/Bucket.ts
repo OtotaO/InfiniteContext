@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { Vector, Chunk, SearchResult, BucketConfig, ChunkSummary } from './types.js';
+import { Vector, Chunk, SearchResult, BucketConfig } from './types.js';
 import { VectorStore } from './VectorStore.js';
 
 /**
@@ -76,6 +76,9 @@ export class Bucket {
   public addChunk(chunk: Chunk): number {
     // Ensure the chunk has the correct domain
     chunk.metadata.domain = this.domain;
+    chunk.metadata.bucket = this.name;
+    chunk.metadata.bucketId = this.id;
+    chunk.metadata.bucketName = this.name;
     return this.vectorStore.addChunk(chunk);
   }
 
@@ -89,6 +92,9 @@ export class Bucket {
     // Ensure all chunks have the correct domain
     for (const chunk of chunks) {
       chunk.metadata.domain = this.domain;
+      chunk.metadata.bucket = this.name;
+      chunk.metadata.bucketId = this.id;
+      chunk.metadata.bucketName = this.name;
     }
     return this.vectorStore.addChunks(chunks);
   }
@@ -180,15 +186,7 @@ export class Bucket {
    * @returns An array of chunks
    */
   public getAllChunks(recursive: boolean = true): Chunk[] {
-    const chunks: Chunk[] = [];
-    
-    // Add chunks from this bucket's vector store
-    for (let i = 0; i < this.vectorStore.size(); i++) {
-      const results = this.vectorStore.search([], 1);
-      if (results.length > 0) {
-        chunks.push(results[0].chunk);
-      }
-    }
+    const chunks: Chunk[] = [...this.vectorStore.getAllChunks(true)];
     
     // Add chunks from sub-buckets if recursive
     if (recursive) {
@@ -198,6 +196,26 @@ export class Bucket {
     }
     
     return chunks;
+  }
+
+
+  /**
+   * Update a chunk stored in this bucket or any descendant bucket.
+   */
+  public updateChunk(chunk: Chunk, recursive: boolean = true): boolean {
+    if (this.vectorStore.updateChunk(chunk)) {
+      return true;
+    }
+
+    if (recursive) {
+      for (const subBucket of this.subBuckets.values()) {
+        if (subBucket.updateChunk(chunk, true)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   /**

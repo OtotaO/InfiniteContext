@@ -15,6 +15,7 @@ import { Chunk, ChunkSummary } from '../core/types.js';
 import { errorHandler, StorageError, ErrorCodes } from './ErrorHandler.js';
 import { transactionManager, createOperation } from './TransactionManager.js';
 import { calculateChunkHash } from './IntegrityVerifier.js';
+import { sanitizeChunkForExport } from './MemorySafety.js';
 
 /**
  * Export format
@@ -37,6 +38,8 @@ export interface ExportOptions {
   includeEmbeddings?: boolean;
   includeSummaries?: boolean;
   filter?: (chunk: Chunk) => boolean;
+  redactDeleted?: boolean;
+  includeDeleted?: boolean;
 }
 
 /**
@@ -50,6 +53,8 @@ export interface ImportOptions {
   generateEmbeddings?: boolean;
   generateSummaries?: boolean;
   filter?: (chunk: Chunk) => boolean;
+  redactDeleted?: boolean;
+  includeDeleted?: boolean;
   onProgress?: (progress: ImportProgress) => void;
 }
 
@@ -118,12 +123,14 @@ export class DataPortabilityManager {
         await fs.promises.mkdir(outputDir, { recursive: true });
       }
       
-      // Filter chunks if a filter is provided
-      const filteredChunks = options.filter ? chunks.filter(options.filter) : chunks;
+      // Filter chunks if a filter is provided and remove deleted memories by default.
+      const filteredChunks = (options.filter ? chunks.filter(options.filter) : chunks)
+        .map(chunk => sanitizeChunkForExport(chunk, !!options.includeDeleted))
+        .filter((chunk): chunk is Chunk => chunk !== null);
       
       // Process chunks for export
       const processedChunks = filteredChunks.map(chunk => {
-        const processedChunk = { ...chunk };
+        const processedChunk = { ...chunk, metadata: { ...chunk.metadata } };
         
         // Remove embeddings if not included
         if (!options.includeEmbeddings) {
@@ -136,7 +143,7 @@ export class DataPortabilityManager {
         }
         
         // Add hash for integrity verification
-        (processedChunk.metadata as any).hash = calculateChunkHash(chunk);
+        (processedChunk.metadata as any).hash = calculateChunkHash(processedChunk);
         
         return processedChunk;
       });
@@ -255,8 +262,10 @@ export class DataPortabilityManager {
           throw new Error(`Unsupported import format: ${format}`);
       }
       
-      // Filter chunks if a filter is provided
-      const filteredChunks = options.filter ? chunks.filter(options.filter) : chunks;
+      // Filter chunks if a filter is provided and remove deleted memories by default.
+      const filteredChunks = (options.filter ? chunks.filter(options.filter) : chunks)
+        .map(chunk => sanitizeChunkForExport(chunk, !!options.includeDeleted))
+        .filter((chunk): chunk is Chunk => chunk !== null);
       
       // Process chunks
       const result: ImportResult = {

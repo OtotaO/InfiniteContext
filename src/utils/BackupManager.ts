@@ -11,7 +11,10 @@ import os from 'os';
 import { createGzip } from 'zlib';
 import { pipeline } from 'stream/promises';
 import { createReadStream, createWriteStream } from 'fs';
+import { Readable } from 'stream';
 import { errorHandler, StorageError, ErrorCodes } from './ErrorHandler.js';
+import { calculateManifestHash, verifyManifest } from './IntegrityVerifier.js';
+import { sanitizeChunkForExport } from './MemorySafety.js';
 import { transactionManager, createOperation } from './TransactionManager.js';
 
 /**
@@ -34,6 +37,7 @@ export interface BackupMetadata {
   timestamp: string;
   version: string;
   options: BackupOptions;
+  integrityHash?: string;
   stats: {
     totalSize: number;
     bucketCount: number;
@@ -165,6 +169,8 @@ export class BackupManager {
         stats: await this.calculateBackupStats(backupDir),
       };
       
+      metadata.integrityHash = calculateManifestHash(metadata as any);
+
       // Write backup metadata
       await fs.promises.writeFile(
         path.join(backupDir, 'metadata.json'),
@@ -227,6 +233,10 @@ export class BackupManager {
       }
       
       const metadata = JSON.parse(await fs.promises.readFile(metadataPath, 'utf-8')) as BackupMetadata;
+      const manifestVerification = verifyManifest(metadata as any);
+      if (!manifestVerification.isValid) {
+        throw new Error(`Backup manifest integrity check failed: ${manifestVerification.errors.map(error => error.message).join('; ')}`);
+      }
       
       // Get list of buckets to recover
       const buckets = await this.getBucketsToRecover(backupDir, options);
@@ -363,6 +373,10 @@ export class BackupManager {
         if (fs.existsSync(metadataPath)) {
           try {
             const metadata = JSON.parse(await fs.promises.readFile(metadataPath, 'utf-8')) as BackupMetadata;
+      const manifestVerification = verifyManifest(metadata as any);
+      if (!manifestVerification.isValid) {
+        throw new Error(`Backup manifest integrity check failed: ${manifestVerification.errors.map(error => error.message).join('; ')}`);
+      }
             backups.push(metadata);
           } catch (error) {
             console.error(`Failed to read backup metadata: ${metadataPath}`, error);
@@ -568,13 +582,46 @@ export class BackupManager {
     // Compress the file
     const gzipTargetPath = `${targetPath}.gz`;
     
+    const safeBackup = await this.getSafeBackupPayload(sourcePath);
+    if (safeBackup === null) {
+      return;
+    }
+
     await pipeline(
-      createReadStream(sourcePath),
+      safeBackup === undefined ? createReadStream(sourcePath) : Readable.from(safeBackup),
       createGzip(),
       createWriteStream(gzipTargetPath)
     );
   }
   
+
+
+  /**
+   * Return sanitized JSON for chunk-like files, undefined for passthrough, or null to skip deleted chunks.
+   */
+  private async getSafeBackupPayload(sourcePath: string): Promise<string | undefined | null> {
+    try {
+      if (sourcePath.endsWith('.meta')) {
+        const metadata = JSON.parse(await fs.promises.readFile(sourcePath, 'utf-8'));
+        if (metadata.deletionStatus === 'deleted') {
+          return JSON.stringify(metadata, null, 2);
+        }
+        return undefined;
+      }
+
+      const content = await fs.promises.readFile(sourcePath, 'utf-8');
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed === 'object' && 'content' in parsed && 'metadata' in parsed) {
+        const sanitized = sanitizeChunkForExport(parsed, true);
+        return sanitized ? JSON.stringify(sanitized, null, 2) : null;
+      }
+    } catch {
+      return undefined;
+    }
+
+    return undefined;
+  }
+
   /**
    * Recover a directory
    * 

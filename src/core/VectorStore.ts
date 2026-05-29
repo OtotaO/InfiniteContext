@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import { dirname } from 'path';
-import { Vector, SearchResult, Chunk } from './types.js';
+import { Vector, SearchResult, Chunk, DeletionStatus } from './types.js';
 
 /**
  * Simple in-memory vector store implementation with basic search functionality.
@@ -111,11 +111,12 @@ export class VectorStore {
     }
 
     // Calculate distances
-    const results = this.chunks.map((chunk, id) => ({
-      chunk,
-      score: this.calculateDistance(queryVector, chunk.embedding),
-      id
-    }));
+    const results = this.chunks
+      .filter(chunk => chunk.metadata.deletionStatus !== DeletionStatus.DELETED)
+      .map(chunk => ({
+        chunk,
+        score: this.calculateDistance(queryVector, chunk.embedding),
+      }));
 
     // Sort by score (descending)
     results.sort((a, b) => b.score - a.score);
@@ -125,10 +126,31 @@ export class VectorStore {
   }
 
   /**
+   * Get a copy of all chunks in insertion order.
+   */
+  public getAllChunks(includeDeleted: boolean = false): Chunk[] {
+    return this.chunks.filter(chunk => includeDeleted || chunk.metadata.deletionStatus !== DeletionStatus.DELETED);
+  }
+
+  /**
+   * Replace a chunk by ID.
+   */
+  public updateChunk(chunk: Chunk): boolean {
+    const index = this.chunks.findIndex(existing => existing.id === chunk.id);
+    if (index === -1) {
+      return false;
+    }
+
+    this.chunks[index] = chunk;
+    this.dirty = true;
+    return true;
+  }
+
+  /**
    * Get the number of chunks in the store
    */
-  public size(): number {
-    return this.chunks.length;
+  public size(includeDeleted: boolean = true): number {
+    return this.getAllChunks(includeDeleted).length;
   }
 
   /**

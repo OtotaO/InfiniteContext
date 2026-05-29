@@ -42,8 +42,9 @@ import os from 'os';
 import { MemoryManager } from './core/MemoryManager.js';
 import { SummarizationEngine } from './summarization/SummarizationEngine.js';
 import { GoogleDriveProvider } from './providers/GoogleDriveProvider.js';
-import { Chunk, ChunkLocation, Metadata, StorageTier, Vector } from './core/types.js';
+import { Chunk, ChunkLocation, MemoryQuery, Metadata, ProfileMemory, StorageTier, Vector } from './core/types.js';
 import { PromptCategorizer } from './categorization/PromptCategorizer.js';
+import { isRetrievable } from './utils/MemorySafety.js';
 
 /**
  * Main InfiniteContext class that provides a simplified API for using the system
@@ -192,6 +193,9 @@ export class InfiniteContext {
       bucketName?: string;
       bucketDomain?: string;
       metadata?: Partial<Omit<Metadata, 'id' | 'timestamp'>>;
+      retentionPolicy?: Metadata['retentionPolicy'];
+      expiresAt?: string;
+      sensitivity?: Metadata['sensitivity'];
       summarize?: boolean;
       preferredTier?: StorageTier;
     } = {}
@@ -220,6 +224,9 @@ export class InfiniteContext {
       domain: bucketDomain,
       source: 'user-input',
       tags: [],
+      retentionPolicy: options.retentionPolicy,
+      expiresAt: options.expiresAt,
+      sensitivity: options.sensitivity,
       ...metadata,
     }, summarize);
     
@@ -282,10 +289,47 @@ export class InfiniteContext {
       searchResults = searchResults.slice(0, maxResults);
     }
     
-    // Filter by minimum score
-    searchResults = searchResults.filter(result => result.score >= minScore);
+    // Filter by minimum score and production safety controls.
+    searchResults = searchResults.filter(result => result.score >= minScore && isRetrievable(result.chunk));
     
     return searchResults;
+  }
+
+
+
+  /**
+   * Store or update a user profile memory with retention and sensitivity controls.
+   */
+  public upsertProfileMemory(memory: Omit<ProfileMemory, 'id' | 'createdAt' | 'updatedAt' | 'retentionPolicy' | 'sensitivity' | 'deletionStatus'> & Partial<Pick<ProfileMemory, 'id' | 'createdAt' | 'retentionPolicy' | 'sensitivity' | 'deletionStatus'>>): ProfileMemory {
+    return this.memoryManager.upsertProfileMemory(memory);
+  }
+
+  /**
+   * List chunk and profile memories by user, domain, bucket, tag, or sensitivity.
+   */
+  public listMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+    return this.memoryManager.listMemories(query);
+  }
+
+  /**
+   * Redact memories by user, domain, bucket, tag, or sensitivity.
+   */
+  public redactMemories(query: MemoryQuery, reason?: string): { matched: number; changed: number } {
+    return this.memoryManager.redactMemories(query, reason);
+  }
+
+  /**
+   * Export memories with redaction/deletion markers respected.
+   */
+  public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+    return this.memoryManager.exportMemories(query);
+  }
+
+  /**
+   * Mark memories deleted by user, domain, bucket, tag, or sensitivity.
+   */
+  public deleteMemories(query: MemoryQuery, reason?: string): { matched: number; changed: number } {
+    return this.memoryManager.deleteMemories(query, reason);
   }
 
   /**
@@ -414,6 +458,7 @@ export class InfiniteContext {
     compress?: boolean;
     includeEmbeddings?: boolean;
     includeSummaries?: boolean;
+    includeDeleted?: boolean;
   }): Promise<any> {
     const { exportChunks, ExportFormat } = await import('./utils/DataPortability.js');
     

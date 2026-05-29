@@ -4,13 +4,84 @@
 
 export type Vector = number[];
 
-export interface Metadata {
+export enum RetentionPolicy {
+  TRANSIENT = 'transient',
+  STANDARD = 'standard',
+  ARCHIVE = 'archive',
+  LEGAL_HOLD = 'legal_hold'
+}
+
+export enum SensitivityLevel {
+  PUBLIC = 'public',
+  INTERNAL = 'internal',
+  CONFIDENTIAL = 'confidential',
+  RESTRICTED = 'restricted'
+}
+
+export enum DeletionStatus {
+  ACTIVE = 'active',
+  REDACTED = 'redacted',
+  DELETED = 'deleted'
+}
+
+export interface RetentionMetadata {
+  retentionPolicy?: RetentionPolicy | string;
+  expiresAt?: string;
+  sensitivity?: SensitivityLevel | string;
+  deletionStatus?: DeletionStatus | string;
+  deletedAt?: string;
+  redactedAt?: string;
+  deletionReason?: string;
+}
+
+export interface Metadata extends RetentionMetadata {
   id: string;
+  userId?: string;
   domain: string;
+  bucket?: string;
+  bucketId?: string;
+  bucketName?: string;
   timestamp: string;
   source: string;
   tags: string[];
   [key: string]: unknown;
+}
+
+export interface ProfileMemory {
+  id: string;
+  userId: string;
+  domain: string;
+  bucket?: string;
+  key: string;
+  value: unknown;
+  tags: string[];
+  createdAt: string;
+  updatedAt: string;
+  retentionPolicy?: RetentionPolicy | string;
+  expiresAt?: string;
+  sensitivity?: SensitivityLevel | string;
+  deletionStatus?: DeletionStatus | string;
+  deletedAt?: string;
+  redactedAt?: string;
+  deletionReason?: string;
+}
+
+export interface MemoryQuery {
+  userId?: string;
+  domain?: string;
+  bucket?: string;
+  bucketId?: string;
+  bucketName?: string;
+  tag?: string;
+  tags?: string[];
+  sensitivity?: SensitivityLevel | string;
+  includeExpired?: boolean;
+  includeDeleted?: boolean;
+}
+
+export interface MemoryMutationResult {
+  matched: number;
+  changed: number;
 }
 
 export interface ChunkSummary {
