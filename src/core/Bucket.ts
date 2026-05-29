@@ -180,15 +180,7 @@ export class Bucket {
    * @returns An array of chunks
    */
   public getAllChunks(recursive: boolean = true): Chunk[] {
-    const chunks: Chunk[] = [];
-    
-    // Add chunks from this bucket's vector store
-    for (let i = 0; i < this.vectorStore.size(); i++) {
-      const results = this.vectorStore.search([], 1);
-      if (results.length > 0) {
-        chunks.push(results[0].chunk);
-      }
-    }
+    const chunks = this.vectorStore.getAllChunks();
     
     // Add chunks from sub-buckets if recursive
     if (recursive) {
