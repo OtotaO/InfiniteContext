@@ -19,12 +19,43 @@ export interface ChunkSummary {
   concepts: string[];
 }
 
+export interface MemoryMetadata {
+  /**
+   * Confidence/importance multiplier for retrieval. Defaults to 1.0.
+   */
+  weight: number;
+  /**
+   * ISO timestamp for the most recent retrieval access.
+   */
+  lastAccessedAt: string;
+  /**
+   * Number of times this memory has been returned from retrieval.
+   */
+  accessCount: number;
+  /**
+   * Exponential decay rate applied per day since last access.
+   */
+  decayRate: number;
+  /**
+   * ISO timestamp set when a memory is rebutted/stale.
+   */
+  invalidatedAt?: string;
+}
+
+export type MemoryFeedback = 'approve' | 'neutral' | 'rebut';
+
 export interface Chunk {
   id: string;
   content: string;
   embedding: Vector;
   metadata: Metadata;
   summaries: ChunkSummary[];
+  /**
+   * Lifecycle metadata used for decay-aware retrieval scoring. Optional because
+   * chunks may be constructed before metadata is stamped; the vector store
+   * lazily initializes it via ensureMemoryMetadata.
+   */
+  memory?: MemoryMetadata;
 }
 
 export interface SearchResult {
