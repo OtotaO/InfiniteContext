@@ -83,7 +83,7 @@ export class VectorStore {
     }
   }
 
-  private calculateDistance(a: Vector, b: Vector): number {
+  public calculateSimilarity(a: Vector, b: Vector): number {
     if (a.length !== b.length) {
       throw new Error('Vectors must have the same dimension');
     }
@@ -175,7 +175,7 @@ export class VectorStore {
    * Blend vector similarity with decayed memory confidence/lifecycle weight.
    */
   private calculateRetrievalScore(queryVector: Vector, chunk: Chunk, now: Date = new Date()): number {
-    const semanticScore = this.calculateDistance(queryVector, chunk.embedding);
+    const semanticScore = this.calculateSimilarity(queryVector, chunk.embedding);
     return semanticScore * this.getEffectiveMemoryWeight(chunk, now);
   }
 
@@ -319,6 +319,17 @@ export class VectorStore {
    */
   public getChunks(): Chunk[] {
     return [...this.chunks];
+  }
+
+
+  /**
+   * Search and include how many stored vectors were evaluated.
+   */
+  public searchWithStats(queryVector: Vector, k: number = 10): { results: SearchResult[]; candidatesScanned: number } {
+    return {
+      results: this.search(queryVector, k),
+      candidatesScanned: this.chunks.length
+    };
   }
 
   /**

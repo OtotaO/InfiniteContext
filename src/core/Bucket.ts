@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { Vector, Chunk, SearchResult, BucketConfig, MemoryFeedback } from './types.js';
+import { Vector, Chunk, SearchResult, BucketConfig, MemoryFeedback, ChunkSummary, HierarchyLevel } from './types.js';
 import { VectorStore } from './VectorStore.js';
 
 /**
@@ -92,6 +92,7 @@ export class Bucket {
   public addChunk(chunk: Chunk): number {
     // Ensure the chunk has the correct domain
     chunk.metadata.domain = this.domain;
+    this.prepareChunkForHierarchy(chunk);
     const id = this.vectorStore.addChunk(chunk);
     this.onChange?.();
     return id;
@@ -104,9 +105,8 @@ export class Bucket {
    * @returns The IDs of the chunks in the vector store
    */
   public addChunks(chunks: Chunk[]): number[] {
-    // Ensure all chunks have the correct domain
     for (const chunk of chunks) {
-      chunk.metadata.domain = this.domain;
+      this.prepareChunkForHierarchy(chunk);
     }
     const ids = this.vectorStore.addChunks(chunks);
     this.onChange?.();
@@ -280,6 +280,35 @@ export class Bucket {
     }
 
     return count;
+  }
+
+  /**
+   * Get chunks held directly in this bucket, without traversing sub-buckets.
+   */
+  public getDirectChunks(): Chunk[] {
+    return this.vectorStore.getChunks();
+  }
+
+  /**
+   * Add H-MEM compatible hierarchy pointers to episode-level chunks.
+   */
+  private prepareChunkForHierarchy(chunk: Chunk): void {
+    chunk.metadata.domain = this.domain;
+    chunk.metadata.hierarchyLevel = HierarchyLevel.EPISODE;
+    chunk.metadata.childIds = chunk.metadata.childIds || [];
+
+    const category = (chunk.metadata.category as string | undefined) || chunk.metadata.tags[0] || 'uncategorized';
+    const traceId = (chunk.metadata.memoryTraceId as string | undefined)
+      || (chunk.metadata.traceId as string | undefined)
+      || (chunk.metadata.source as string | undefined)
+      || 'default-trace';
+
+    chunk.hierarchy = {
+      level: HierarchyLevel.EPISODE,
+      parentId: `${this.domain}/${category}/${traceId}`,
+      childIds: [],
+      path: [this.domain, category, traceId, chunk.id]
+    };
   }
 
   /**

@@ -9,6 +9,7 @@
 export { MemoryManager } from './core/MemoryManager.js';
 export { Bucket } from './core/Bucket.js';
 export { VectorStore } from './core/VectorStore.js';
+export { HierarchicalRetriever, type HierarchicalRetrieverOptions } from './core/HierarchicalRetriever.js';
 export { MemoryMonitor, type MemoryAlert } from './core/MemoryMonitor.js';
 export * from './core/types.js';
 
@@ -249,12 +250,15 @@ export class InfiniteContext {
       bucketDomain?: string;
       maxResults?: number;
       minScore?: number;
+      retrievalMode?: 'flat' | 'hierarchical';
+      hierarchicalOptions?: import('./core/HierarchicalRetriever.js').HierarchicalRetrieverOptions;
     } = {}
   ): Promise<Array<{ chunk: Chunk, score: number }>> {
     const bucketName = options.bucketName;
     const bucketDomain = options.bucketDomain;
     const maxResults = options.maxResults || 10;
     const minScore = options.minScore || 0.7;
+    const retrievalMode = options.retrievalMode || 'flat';
 
     // Find relevant buckets
     let searchResults: Array<{ chunk: Chunk, score: number }> = [];
@@ -269,6 +273,13 @@ export class InfiniteContext {
         const queryVector = await this.getEmbedding(query);
         searchResults = bucket.search(queryVector, maxResults, true);
       }
+    } else if (retrievalMode === 'hierarchical') {
+      const routedResults = await this.memoryManager.searchMemory(query, {
+        ...options.hierarchicalOptions,
+        mode: 'hierarchical',
+        k: maxResults
+      });
+      searchResults = routedResults.results.map(({ chunk, score }) => ({ chunk, score }));
     } else {
       // Find the most relevant buckets
       const relevantBuckets = await this.memoryManager.findRelevantBuckets(query, 3);

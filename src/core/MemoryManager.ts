@@ -1,10 +1,11 @@
 import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { Bucket } from './Bucket.js';
-import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, Metadata, StorageTier, Vector } from './types.js';
+import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, HierarchicalSearchResponse, Metadata, SearchResult, StorageTier, Vector } from './types.js';
 import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
+import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './HierarchicalRetriever.js';
 import path from 'path';
 import os from 'os';
 
@@ -228,6 +229,49 @@ export class MemoryManager {
    */
   public getBuckets(): Map<string, Bucket> {
     return new Map(this.rootBuckets);
+  }
+
+  /**
+   * Get every chunk currently indexed by all root buckets.
+   */
+  public getAllChunks(): Chunk[] {
+    return Array.from(this.rootBuckets.values()).flatMap(bucket => bucket.getAllChunks(true));
+  }
+
+  /**
+   * Search indexed memory with either legacy flat search or hierarchical routed retrieval.
+   */
+  public async searchMemory(
+    query: string | Vector,
+    options: (HierarchicalRetrieverOptions & { mode?: 'flat' | 'hierarchical'; k?: number }) = {}
+  ): Promise<HierarchicalSearchResponse> {
+    if (!this.embeddingFunction && typeof query === 'string') {
+      throw new Error('No embedding function provided');
+    }
+
+    const queryVector = typeof query === 'string'
+      ? await this.embeddingFunction!(query)
+      : query;
+    const chunks = this.getAllChunks();
+    const retriever = new HierarchicalRetriever(chunks);
+
+    if (options.mode === 'flat') {
+      return retriever.flatSearch(queryVector, options.k ?? options.finalK ?? 10);
+    }
+
+    return retriever.search(queryVector, {
+      ...options,
+      finalK: options.finalK ?? options.k ?? 10,
+      episodeK: options.episodeK ?? options.k ?? 10
+    });
+  }
+
+  /**
+   * Legacy flat search across all buckets. Kept as a compatibility fallback.
+   */
+  public async flatSearchMemory(query: string | Vector, k: number = 10): Promise<SearchResult[]> {
+    const response = await this.searchMemory(query, { mode: 'flat', k });
+    return response.results.map(({ chunk, score }) => ({ chunk, score }));
   }
 
   /**
