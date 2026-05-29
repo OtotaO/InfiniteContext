@@ -11,6 +11,7 @@ export { Bucket } from './core/Bucket.js';
 export { VectorStore } from './core/VectorStore.js';
 export { HierarchicalRetriever, type HierarchicalRetrieverOptions } from './core/HierarchicalRetriever.js';
 export { MemoryMonitor, type MemoryAlert } from './core/MemoryMonitor.js';
+export { DeterministicMemoryExtractor, extractedMemoryJsonSchema } from './core/MemoryExtractor.js';
 export * from './core/types.js';
 
 // Storage providers
@@ -41,9 +42,11 @@ export { OpenAI };
 import path from 'path';
 import os from 'os';
 import { MemoryManager } from './core/MemoryManager.js';
+import { Bucket } from './core/Bucket.js';
 import { SummarizationEngine } from './summarization/SummarizationEngine.js';
 import { GoogleDriveProvider } from './providers/GoogleDriveProvider.js';
-import { Chunk, ChunkLocation, MemoryFeedback, Metadata, StorageTier, Vector } from './core/types.js';
+import { Chunk, ChunkLocation, ExtractedMemory, MemoryExtractor, MemoryFeedback, Metadata, StorageTier, Vector } from './core/types.js';
+import { DeterministicMemoryExtractor } from './core/MemoryExtractor.js';
 import { PromptCategorizer } from './categorization/PromptCategorizer.js';
 
 /**
@@ -54,6 +57,7 @@ export class InfiniteContext {
   private summarizationEngine: SummarizationEngine;
   private promptCategorizer?: PromptCategorizer;
   private embeddingFunction?: (text: string) => Promise<Vector>;
+  private memoryExtractor: MemoryExtractor;
   private embeddingModel?: any;
   private llmModel?: any;
 
@@ -67,6 +71,7 @@ export class InfiniteContext {
     openai?: OpenAI;
     embeddingModel?: string;
     llmModel?: string;
+    memoryExtractor?: MemoryExtractor;
     categorizerOptions?: {
       cacheSize?: number;
       cacheExpiration?: number;
@@ -97,8 +102,10 @@ export class InfiniteContext {
         return response.data[0].embedding;
       };
     }
-
     this.embeddingFunction = embeddingFunction;
+
+    // Create the memory extractor
+    this.memoryExtractor = options.memoryExtractor || new DeterministicMemoryExtractor();
 
     // Create the memory manager
     this.memoryManager = new MemoryManager({
@@ -602,31 +609,59 @@ export class InfiniteContext {
 
     // Use the categorizer to find the best bucket
     const categorization = await this.promptCategorizer.categorize(prompt, output);
+    const timestamp = new Date().toISOString();
 
-    // Allow manual override
-    const finalBucketName = options.overrideBucket?.name || categorization.bucketName;
-    const finalBucketDomain = options.overrideBucket?.domain || categorization.bucketDomain;
-
-    // Store with the determined bucket
-    const chunkId = await this.storeContent(
-      `Prompt: ${prompt}\n\nOutput: ${output}`,
-      {
-        bucketName: finalBucketName,
-        bucketDomain: finalBucketDomain,
-        metadata: {
-          ...options.metadata,
-          prompt,
-          output,
-          categorization: {
-            confidence: categorization.confidence,
-            strategy: categorization.strategy,
-            automatic: !options.overrideBucket
-          }
-        },
-        summarize: options.summarize,
-        preferredTier: options.preferredTier
+    // Extract structured memory before storage so the episode can be routed into
+    // domain/category/trace hierarchy nodes instead of a flat categorization bucket.
+    const extractedMemory = await this.memoryExtractor.extractMemory({
+      prompt,
+      output,
+      timestamp,
+      metadata: {
+        ...options.metadata,
+        domain: options.overrideBucket?.domain || options.metadata?.domain || categorization.bucketDomain,
+        bucketName: options.overrideBucket?.name || categorization.bucketName,
+        category: options.overrideBucket?.name || categorization.bucketName
       }
-    );
+    });
+
+    if (!extractedMemory) {
+      throw new Error('Memory extractor did not return an extracted memory payload.');
+    }
+
+    const finalMemory: ExtractedMemory = {
+      ...extractedMemory,
+      domain: options.overrideBucket?.domain || extractedMemory.domain,
+      category: options.overrideBucket?.name || extractedMemory.category,
+      timestamp: extractedMemory.timestamp || timestamp
+    };
+    const traceBucket = this.resolveMemoryTraceBucket(finalMemory);
+    const summarize = options.summarize !== false;
+    const preferredTier = options.preferredTier || StorageTier.LOCAL;
+
+    // Create and store the episode-level chunk under the resolved trace node.
+    const chunk = await this.memoryManager.createChunk(finalMemory.episodeText, {
+      domain: finalMemory.domain,
+      source: 'prompt-output-memory-extraction',
+      tags: [finalMemory.category, finalMemory.memoryTrace],
+      ...options.metadata,
+      prompt,
+      output,
+      extractedMemory: finalMemory,
+      memoryHierarchy: {
+        domain: finalMemory.domain,
+        category: finalMemory.category,
+        trace: finalMemory.memoryTrace
+      },
+      categorization: {
+        confidence: categorization.confidence,
+        strategy: categorization.strategy,
+        automatic: !options.overrideBucket
+      }
+    }, summarize);
+
+    traceBucket.addChunk(chunk);
+    await this.memoryManager.storeChunk(chunk, preferredTier);
 
     // If there was a manual override, record it as feedback
     if (options.overrideBucket) {
@@ -638,7 +673,56 @@ export class InfiniteContext {
       );
     }
 
-    return chunkId;
+    return chunk.id;
+  }
+
+  /**
+   * Resolve or create the hierarchy for an extracted memory.
+   *
+   * The hierarchy is: domain root bucket -> category sub-bucket -> memory trace
+   * sub-bucket. Episode chunks are stored on the trace bucket.
+   */
+  private resolveMemoryTraceBucket(memory: ExtractedMemory): Bucket {
+    const domainBucket = this.findOrCreateRootBucket(
+      memory.domain,
+      memory.domain,
+      `Memory domain: ${memory.domain}`
+    );
+    const categoryBucket = this.findOrCreateSubBucket(
+      domainBucket,
+      memory.category,
+      memory.domain,
+      `Memory category: ${memory.category}`
+    );
+
+    return this.findOrCreateSubBucket(
+      categoryBucket,
+      memory.memoryTrace,
+      memory.domain,
+      `Memory trace: ${memory.memoryTrace}`
+    );
+  }
+
+  private findOrCreateRootBucket(name: string, domain: string, description: string): Bucket {
+    const existingBucket = Array.from(this.memoryManager.getBuckets().values())
+      .find(bucket => bucket.getName() === name && bucket.getDomain() === domain);
+
+    return existingBucket || this.memoryManager.createBucket({
+      name,
+      domain,
+      description
+    });
+  }
+
+  private findOrCreateSubBucket(parent: Bucket, name: string, domain: string, description: string): Bucket {
+    const existingBucket = Array.from(parent.getSubBuckets().values())
+      .find(bucket => bucket.getName() === name && bucket.getDomain() === domain);
+
+    return existingBucket || parent.addSubBucket({
+      name,
+      domain,
+      description
+    });
   }
 
   /**

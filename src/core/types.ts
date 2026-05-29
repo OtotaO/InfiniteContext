@@ -111,6 +111,27 @@ export interface HierarchicalSearchResponse {
   stats: HierarchicalSearchStats;
 }
 
+export interface ExtractedMemory {
+  domain: string;
+  category: string;
+  memoryTrace: string;
+  episodeText: string;
+  timestamp: string;
+  userProfileAttributes: Record<string, unknown>;
+  confidence: number;
+}
+
+export interface MemoryExtractionInput {
+  prompt: string;
+  output: string;
+  timestamp?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface MemoryExtractor {
+  extractMemory(input: MemoryExtractionInput): Promise<ExtractedMemory | null>;
+}
+
 export interface StorageQuota {
   used: number;
   total: number;

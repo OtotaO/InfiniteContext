@@ -181,8 +181,9 @@ export class Bucket {
    * @param config - The sub-bucket configuration
    * @returns The created sub-bucket
    */
-  public addSubBucket(config: Omit<BucketConfig, 'parentId'>): Bucket {
+  public addSubBucket(config: Omit<BucketConfig, 'id' | 'parentId'> & Partial<Pick<BucketConfig, 'id'>>): Bucket {
     const fullConfig: BucketConfig = {
+      id: config.id || uuidv4(),
       ...config,
       parentId: this.id
     };
