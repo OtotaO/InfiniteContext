@@ -11,7 +11,9 @@ import { createGzip, createGunzip } from 'zlib';
 import { pipeline } from 'stream/promises';
 import { createReadStream, createWriteStream } from 'fs';
 import { Readable } from 'stream';
-import { Chunk, ChunkSummary } from '../core/types.js';
+import { Chunk, ChunkSummary, EmbeddingFunction, StorageTier, Vector } from '../core/types.js';
+import { MemoryManager } from '../core/MemoryManager.js';
+import { SummarizationEngine } from '../summarization/SummarizationEngine.js';
 import { errorHandler, StorageError, ErrorCodes } from './ErrorHandler.js';
 import { transactionManager, createOperation } from './TransactionManager.js';
 import { calculateChunkHash } from './IntegrityVerifier.js';
@@ -49,6 +51,11 @@ export interface ImportOptions {
   decompress?: boolean;
   generateEmbeddings?: boolean;
   generateSummaries?: boolean;
+  embeddingFunction?: EmbeddingFunction;
+  summarizationEngine?: SummarizationEngine;
+  memoryManager?: MemoryManager;
+  preferredTier?: StorageTier;
+  summaryLevels?: number;
   filter?: (chunk: Chunk) => boolean;
   onProgress?: (progress: ImportProgress) => void;
 }
@@ -78,11 +85,25 @@ export interface ExportResult {
 /**
  * Import result
  */
+export interface SkippedImportChunk {
+  chunkId?: string;
+  index: number;
+  reason: string;
+}
+
+export interface StorageFailure {
+  chunkId: string;
+  error: Error;
+}
+
 export interface ImportResult {
   total: number;
   succeeded: number;
   failed: number;
   skipped: number;
+  insertedChunkIds: string[];
+  skippedInvalidChunks: SkippedImportChunk[];
+  storageFailures: StorageFailure[];
   errors: Error[];
 }
 
@@ -255,50 +276,148 @@ export class DataPortabilityManager {
           throw new Error(`Unsupported import format: ${format}`);
       }
       
-      // Filter chunks if a filter is provided
-      const filteredChunks = options.filter ? chunks.filter(options.filter) : chunks;
-      
-      // Process chunks
       const result: ImportResult = {
-        total: filteredChunks.length,
+        total: chunks.length,
         succeeded: 0,
         failed: 0,
         skipped: 0,
+        insertedChunkIds: [],
+        skippedInvalidChunks: [],
+        storageFailures: [],
         errors: [],
       };
-      
-      // Update bucket name and domain if provided
-      if (options.bucketName || options.bucketDomain) {
-        for (const chunk of filteredChunks) {
-          if (options.bucketName) {
-            chunk.metadata.bucketName = options.bucketName;
+
+      const memoryManager = options.memoryManager;
+      const embeddingFunction = options.embeddingFunction;
+      const summarizationEngine = options.summarizationEngine;
+
+      if (options.generateEmbeddings && !embeddingFunction) {
+        throw new Error('An embeddingFunction is required when generateEmbeddings is enabled');
+      }
+
+      if (options.generateSummaries && !summarizationEngine) {
+        throw new Error('A summarizationEngine is required when generateSummaries is enabled');
+      }
+
+      for (let index = 0; index < chunks.length; index++) {
+        const chunk = chunks[index];
+        const chunkId = chunk?.id;
+
+        if (!this.isValidImportChunkShape(chunk)) {
+          result.skipped++;
+          result.skippedInvalidChunks.push({
+            chunkId,
+            index,
+            reason: 'Chunk must include a string id, string content, metadata object, and summaries array',
+          });
+          continue;
+        }
+
+        if (options.filter && !options.filter(chunk)) {
+          result.skipped++;
+          result.skippedInvalidChunks.push({
+            chunkId: chunk.id,
+            index,
+            reason: 'Chunk rejected by import filter',
+          });
+          continue;
+        }
+
+        chunk.metadata.id = chunk.metadata.id || chunk.id;
+        chunk.metadata.timestamp = chunk.metadata.timestamp || new Date().toISOString();
+        chunk.metadata.source = chunk.metadata.source || 'import';
+        chunk.metadata.tags = Array.isArray(chunk.metadata.tags) ? chunk.metadata.tags : [];
+
+        const importedBucketName = typeof chunk.metadata.bucketName === 'string'
+          ? chunk.metadata.bucketName
+          : undefined;
+        const bucketName = options.bucketName || importedBucketName || 'default';
+        const bucketDomain = options.bucketDomain || chunk.metadata.domain || 'general';
+        chunk.metadata.bucketName = bucketName;
+        chunk.metadata.domain = bucketDomain;
+
+        if (!this.hasValidEmbedding(chunk.embedding)) {
+          if (!options.generateEmbeddings || !embeddingFunction) {
+            result.skipped++;
+            result.skippedInvalidChunks.push({
+              chunkId: chunk.id,
+              index,
+              reason: 'Chunk is missing a valid embedding and embedding generation was not enabled',
+            });
+            continue;
           }
-          
-          if (options.bucketDomain) {
-            chunk.metadata.domain = options.bucketDomain;
+
+          try {
+            chunk.embedding = await embeddingFunction(chunk.content);
+          } catch (error) {
+            result.failed++;
+            const importError = new Error(`Failed to generate embedding for chunk ${chunk.id}: ${(error as Error).message}`);
+            result.errors.push(importError);
+            continue;
+          }
+
+          if (!this.hasValidEmbedding(chunk.embedding)) {
+            result.skipped++;
+            result.skippedInvalidChunks.push({
+              chunkId: chunk.id,
+              index,
+              reason: 'Generated embedding was empty or invalid',
+            });
+            continue;
           }
         }
+
+        if (options.generateSummaries && summarizationEngine) {
+          try {
+            chunk.summaries = await summarizationEngine.summarize(chunk.content, options.summaryLevels);
+          } catch (error) {
+            result.failed++;
+            const importError = new Error(`Failed to generate summaries for chunk ${chunk.id}: ${(error as Error).message}`);
+            result.errors.push(importError);
+            continue;
+          }
+        }
+
+        try {
+          if (memoryManager) {
+            const bucket = this.getOrCreateImportBucket(memoryManager, bucketName, bucketDomain);
+            bucket.addChunk(chunk);
+            result.insertedChunkIds.push(chunk.id);
+          }
+        } catch (error) {
+          result.failed++;
+          const importError = new Error(`Failed to insert chunk ${chunk.id} into vector store: ${(error as Error).message}`);
+          result.errors.push(importError);
+          continue;
+        }
+
+        if (memoryManager) {
+          try {
+            await memoryManager.storeChunk(chunk, options.preferredTier || StorageTier.LOCAL);
+          } catch (error) {
+            result.failed++;
+            const importError = new Error(`Failed to persist imported chunk ${chunk.id}: ${(error as Error).message}`);
+            result.storageFailures.push({
+              chunkId: chunk.id,
+              error: error as Error,
+            });
+            result.errors.push(importError);
+            continue;
+          }
+        }
+
+        result.succeeded++;
+
+        options.onProgress?.({
+          total: result.total,
+          processed: index + 1,
+          succeeded: result.succeeded,
+          failed: result.failed,
+          skipped: result.skipped,
+        });
       }
-      
-      // TODO: Generate embeddings if requested
-      if (options.generateEmbeddings) {
-        // This would require access to the embedding model
-        // For now, we'll just log a warning
-        console.warn('Generating embeddings is not implemented yet');
-      }
-      
-      // TODO: Generate summaries if requested
-      if (options.generateSummaries) {
-        // This would require access to the summarization engine
-        // For now, we'll just log a warning
-        console.warn('Generating summaries is not implemented yet');
-      }
-      
-      // Return the processed chunks and result
-      return {
-        ...result,
-        succeeded: filteredChunks.length,
-      };
+
+      return result;
     } catch (error) {
       errorHandler.handleError(
         new StorageError(`Import failed: ${(error as Error).message}`, {
@@ -310,11 +429,61 @@ export class DataPortabilityManager {
           recoverable: false,
         })
       );
-      
+
       throw error;
     }
   }
-  
+
+
+  /**
+   * Get an existing import target bucket or create one for the imported chunk.
+   */
+  private getOrCreateImportBucket(
+    memoryManager: MemoryManager,
+    bucketName: string,
+    bucketDomain: string
+  ): ReturnType<MemoryManager['createBucket']> {
+    const existingBucket = Array.from(memoryManager.getBuckets().values())
+      .find(bucket => bucket.getName() === bucketName && bucket.getDomain() === bucketDomain);
+
+    if (existingBucket) {
+      return existingBucket;
+    }
+
+    return memoryManager.createBucket({
+      name: bucketName,
+      domain: bucketDomain,
+      description: `Imported bucket for ${bucketName} (${bucketDomain})`,
+    });
+  }
+
+  /**
+   * Check whether an imported chunk has the minimal shape needed for import.
+   */
+  private isValidImportChunkShape(chunk: unknown): chunk is Chunk {
+    if (!chunk || typeof chunk !== 'object') {
+      return false;
+    }
+
+    const candidate = chunk as Partial<Chunk>;
+    return (
+      typeof candidate.id === 'string' &&
+      candidate.id.length > 0 &&
+      typeof candidate.content === 'string' &&
+      candidate.content.length > 0 &&
+      typeof candidate.metadata === 'object' &&
+      candidate.metadata !== null &&
+      Array.isArray(candidate.summaries)
+    );
+  }
+
+  /**
+   * Check whether an embedding exists and contains only finite numeric values.
+   */
+  private hasValidEmbedding(embedding: Vector | undefined): embedding is Vector {
+    return Array.isArray(embedding) && embedding.length > 0 && embedding.every(value => Number.isFinite(value));
+  }
+
   /**
    * Export chunks as JSON
    * 
