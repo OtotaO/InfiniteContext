@@ -52,6 +52,7 @@ export class InfiniteContext {
   private memoryManager: MemoryManager;
   private summarizationEngine: SummarizationEngine;
   private promptCategorizer?: PromptCategorizer;
+  private embeddingFunction?: (text: string) => Promise<Vector>;
   private embeddingModel?: any;
   private llmModel?: any;
 
@@ -91,11 +92,13 @@ export class InfiniteContext {
           model: this.embeddingModel,
           input: text,
         });
-        
+
         return response.data[0].embedding;
       };
     }
-    
+
+    this.embeddingFunction = embeddingFunction;
+
     // Create the memory manager
     this.memoryManager = new MemoryManager({
       basePath,
@@ -445,10 +448,17 @@ export class InfiniteContext {
     decompress?: boolean;
     generateEmbeddings?: boolean;
     generateSummaries?: boolean;
+    preferredTier?: StorageTier;
+    summaryLevels?: number;
   }): Promise<any> {
     const { importChunks } = await import('./utils/DataPortability.js');
     
-    return importChunks(options);
+    return importChunks({
+      ...options,
+      memoryManager: this.memoryManager,
+      embeddingFunction: options.generateEmbeddings ? this.embeddingFunction : undefined,
+      summarizationEngine: options.generateSummaries ? this.summarizationEngine : undefined,
+    });
   }
 
   /**
