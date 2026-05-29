@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { Bucket } from './Bucket.js';
-import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, Metadata, StorageTier, Vector } from './types.js';
+import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, Metadata, StorageTier, Vector } from './types.js';
 import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
@@ -23,7 +23,7 @@ export class MemoryManager {
 
   /**
    * Create a new MemoryManager
-   * 
+   *
    * @param options - Configuration options
    */
   constructor(options: {
@@ -38,7 +38,7 @@ export class MemoryManager {
   } = {}) {
     this.basePath = options.basePath || path.join(os.homedir(), '.infinite-context');
     this.embeddingFunction = options.embeddingFunction;
-    
+
     // Initialize memory monitor
     this.memoryMonitor = new MemoryMonitor({
       ...options.monitoringConfig,
@@ -48,7 +48,7 @@ export class MemoryManager {
 
   /**
    * Initialize the memory manager
-   * 
+   *
    * @param options - Initialization options
    */
   public async initialize(options: {
@@ -63,24 +63,24 @@ export class MemoryManager {
 
   /**
    * Add a storage provider
-   * 
+   *
    * @param provider - The storage provider to add
    * @returns True if the provider was added, false if a provider with the same ID already exists
    */
   public addStorageProvider(provider: StorageProvider): boolean {
     const id = provider.getId();
-    
+
     if (this.storageProviders.has(id)) {
       return false;
     }
-    
+
     this.storageProviders.set(id, provider);
     return true;
   }
 
   /**
    * Get a storage provider by ID
-   * 
+   *
    * @param id - The provider ID
    * @returns The storage provider, or undefined if not found
    */
@@ -90,7 +90,7 @@ export class MemoryManager {
 
   /**
    * Remove a storage provider
-   * 
+   *
    * @param id - The provider ID
    * @returns True if the provider was removed, false if not found
    */
@@ -100,7 +100,7 @@ export class MemoryManager {
 
   /**
    * Get all storage providers
-   * 
+   *
    * @returns A map of provider IDs to providers
    */
   public getStorageProviders(): Map<string, StorageProvider> {
@@ -109,7 +109,7 @@ export class MemoryManager {
 
   /**
    * Create a new bucket
-   * 
+   *
    * @param config - The bucket configuration
    * @returns The created bucket
    */
@@ -118,16 +118,16 @@ export class MemoryManager {
       id: uuidv4(),
       ...config
     };
-    
+
     const bucket = new Bucket(fullConfig);
     this.rootBuckets.set(bucket.getId(), bucket);
-    
+
     return bucket;
   }
 
   /**
    * Get a bucket by ID
-   * 
+   *
    * @param id - The bucket ID
    * @returns The bucket, or undefined if not found
    */
@@ -137,7 +137,7 @@ export class MemoryManager {
 
   /**
    * Remove a bucket
-   * 
+   *
    * @param id - The bucket ID
    * @returns True if the bucket was removed, false if not found
    */
@@ -147,7 +147,7 @@ export class MemoryManager {
 
   /**
    * Get all root buckets
-   * 
+   *
    * @returns A map of bucket IDs to buckets
    */
   public getBuckets(): Map<string, Bucket> {
@@ -156,7 +156,7 @@ export class MemoryManager {
 
   /**
    * Store a chunk in the appropriate storage provider based on tier priority
-   * 
+   *
    * @param chunk - The chunk to store
    * @param preferredTier - The preferred storage tier
    * @returns The location where the chunk was stored
@@ -192,17 +192,17 @@ export class MemoryManager {
       try {
         // Check if there's enough space
         const quota = await provider.getQuota();
-        
+
         // Serialize the chunk
         const serializedChunk = Buffer.from(JSON.stringify(chunk));
-        
+
         if (quota.available >= serializedChunk.length) {
           // Store the chunk
           const location = await provider.store(serializedChunk, chunk.metadata);
-          
+
           // Remember where the chunk is stored
           this.chunkLocations.set(chunk.id, location);
-          
+
           return location;
         }
       } catch (error) {
@@ -216,26 +216,26 @@ export class MemoryManager {
 
   /**
    * Retrieve a chunk from its stored location
-   * 
+   *
    * @param chunkId - The ID of the chunk to retrieve
    * @returns The retrieved chunk
    */
   public async retrieveChunk(chunkId: string): Promise<Chunk> {
     const location = this.chunkLocations.get(chunkId);
-    
+
     if (!location) {
       throw new Error(`Chunk location not found for ID: ${chunkId}`);
     }
-    
+
     const provider = this.storageProviders.get(location.providerId);
-    
+
     if (!provider) {
       throw new Error(`Storage provider not found for ID: ${location.providerId}`);
     }
-    
+
     // Retrieve the serialized chunk
     const serializedChunk = await provider.retrieve(location);
-    
+
     // Deserialize the chunk
     try {
       return JSON.parse(serializedChunk.toString('utf-8')) as Chunk;
@@ -246,7 +246,7 @@ export class MemoryManager {
 
   /**
    * Create a chunk from text content
-   * 
+   *
    * @param content - The text content
    * @param metadata - The chunk metadata
    * @param summarize - Whether to generate summaries for the chunk
@@ -260,70 +260,100 @@ export class MemoryManager {
     if (!this.embeddingFunction) {
       throw new Error('No embedding function provided');
     }
-    
+
     // Generate embedding
     const embedding = await this.embeddingFunction(content);
-    
+
     // Generate summaries if requested
     const summaries: ChunkSummary[] = summarize
       ? await this.generateSummaries(content)
       : [];
-    
+
     // Extract metadata with proper defaults
     const domain = metadata.domain as string || 'default';
     const source = metadata.source as string || 'user';
     const tags = metadata.tags as string[] || [];
-    
-    // Create the chunk with complete metadata
+
+    const now = new Date().toISOString();
+
+    // Create the chunk with complete metadata and memory lifecycle state
     const chunk: Chunk = {
       id: uuidv4(),
       content,
       embedding,
       metadata: {
         id: uuidv4(),
-        timestamp: new Date().toISOString(),
+        timestamp: now,
         domain,
         source,
         tags,
         ...metadata
       },
-      summaries
+      summaries,
+      memory: {
+        weight: 1,
+        lastAccessedAt: now,
+        accessCount: 0,
+        decayRate: 0.01,
+      }
     };
-    
+
     return chunk;
   }
 
   /**
    * Generate summaries for a chunk of text
-   * 
+   *
    * @param content - The text content
    * @returns An array of summaries at different levels
    */
   private async generateSummaries(content: string): Promise<ChunkSummary[]> {
     // This is a placeholder implementation
     // In a real implementation, this would use an LLM to generate summaries
-    
+
     const summary: ChunkSummary = {
       level: 1,
-      content: content.length > 100 
-        ? content.substring(0, 100) + '...' 
+      content: content.length > 100
+        ? content.substring(0, 100) + '...'
         : content,
       concepts: []
     };
-    
+
     return [summary];
   }
 
   /**
    * Find the most relevant buckets for a query
-   * 
+   *
    * @param query - The query text or vector
    * @param k - The number of buckets to return
    * @returns The most relevant buckets with scores
    */
+
+  /**
+   * Record user feedback for a memory chunk across all buckets.
+   *
+   * Rebutted memories are marked stale and down-weighted, not deleted, so they
+   * can still be audited or revived by later approval.
+   *
+   * @param chunkId - The chunk ID receiving feedback
+   * @param feedback - Approval, neutral signal, or rebuttal
+   * @returns The updated chunk, or undefined if no chunk matched
+   */
+  public recordMemoryFeedback(chunkId: string, feedback: MemoryFeedback): Chunk | undefined {
+    for (const bucket of this.rootBuckets.values()) {
+      const chunk = bucket.recordMemoryFeedback(chunkId, feedback, true);
+      if (chunk) {
+        return chunk;
+      }
+    }
+
+    return undefined;
+  }
+
   /**
    * Add a memory alert handler
-   * 
+   *
    * @param handler - The handler function to add
    */
   public addAlertHandler(handler: (alert: MemoryAlert) => void): void {
@@ -332,7 +362,7 @@ export class MemoryManager {
 
   /**
    * Remove a memory alert handler
-   * 
+   *
    * @param handler - The handler function to remove
    * @returns True if the handler was removed, false if not found
    */
@@ -347,7 +377,7 @@ export class MemoryManager {
 
   /**
    * Get all current memory alerts
-   * 
+   *
    * @param includeAcknowledged - Whether to include acknowledged alerts
    * @returns Array of alerts
    */
@@ -357,7 +387,7 @@ export class MemoryManager {
 
   /**
    * Acknowledge a memory alert
-   * 
+   *
    * @param alertId - The ID of the alert to acknowledge
    * @returns True if the alert was found and acknowledged, false otherwise
    */
@@ -367,7 +397,7 @@ export class MemoryManager {
 
   /**
    * Get memory usage statistics
-   * 
+   *
    * @returns Memory usage statistics
    */
   public async getMemoryStats(): Promise<any> {
@@ -381,7 +411,7 @@ export class MemoryManager {
     // Update the monitor with current buckets and providers
     this.memoryMonitor.registerBuckets(this.rootBuckets);
     this.memoryMonitor.registerProviders(this.storageProviders);
-    
+
     // Start monitoring
     this.memoryMonitor.startMonitoring();
   }
@@ -395,7 +425,7 @@ export class MemoryManager {
 
   /**
    * Handle a memory alert
-   * 
+   *
    * @param alert - The alert to handle
    */
   private handleMemoryAlert(alert: MemoryAlert): void {
@@ -407,7 +437,7 @@ export class MemoryManager {
         console.error('Error in memory alert handler:', error);
       }
     }
-    
+
     // Log the alert
     console.warn(`Memory Alert [${alert.severity}]: ${alert.message}`);
   }
@@ -419,35 +449,35 @@ export class MemoryManager {
     if (!this.embeddingFunction && typeof query === 'string') {
       throw new Error('No embedding function provided');
     }
-    
+
     // Convert query to vector if it's a string
     const queryVector = typeof query === 'string'
       ? await this.embeddingFunction!(query)
       : query;
-    
+
     // Calculate relevance scores for each bucket
     const results: Array<{ bucket: Bucket, score: number }> = [];
-    
+
     for (const bucket of this.rootBuckets.values()) {
       // Get a sample of chunks from the bucket
       const searchResults = bucket.search(queryVector, 5, true);
-      
+
       if (searchResults.length === 0) {
         continue;
       }
-      
+
       // Calculate average score
       const avgScore = searchResults.reduce((sum, result) => sum + result.score, 0) / searchResults.length;
-      
+
       results.push({
         bucket,
         score: avgScore
       });
     }
-    
+
     // Sort by score (descending) and limit to k results
     results.sort((a, b) => b.score - a.score);
-    
+
     return results.slice(0, k);
   }
 }

@@ -1,6 +1,6 @@
 /**
  * Data portability utilities for InfiniteContext
- * 
+ *
  * This module provides utilities for exporting and importing data
  * to enable cross-platform compatibility and data migration.
  */
@@ -91,21 +91,21 @@ export interface ImportResult {
  */
 export class DataPortabilityManager {
   private static instance: DataPortabilityManager;
-  
+
   private constructor() {
     // Private constructor to enforce singleton pattern
   }
-  
+
   public static getInstance(): DataPortabilityManager {
     if (!DataPortabilityManager.instance) {
       DataPortabilityManager.instance = new DataPortabilityManager();
     }
     return DataPortabilityManager.instance;
   }
-  
+
   /**
    * Export chunks to a file
-   * 
+   *
    * @param chunks - The chunks to export
    * @param options - The export options
    * @returns The export result
@@ -117,55 +117,55 @@ export class DataPortabilityManager {
       if (!fs.existsSync(outputDir)) {
         await fs.promises.mkdir(outputDir, { recursive: true });
       }
-      
+
       // Filter chunks if a filter is provided
       const filteredChunks = options.filter ? chunks.filter(options.filter) : chunks;
-      
+
       // Process chunks for export
       const processedChunks = filteredChunks.map(chunk => {
         const processedChunk = { ...chunk };
-        
+
         // Remove embeddings if not included
         if (!options.includeEmbeddings) {
           processedChunk.embedding = [];
         }
-        
+
         // Remove summaries if not included
         if (!options.includeSummaries) {
           processedChunk.summaries = [];
         }
-        
+
         // Add hash for integrity verification
         (processedChunk.metadata as any).hash = calculateChunkHash(chunk);
-        
+
         return processedChunk;
       });
-      
+
       // Export chunks based on format
       let outputPath = options.outputPath;
       let size = 0;
-      
+
       if (options.compress) {
         outputPath = `${outputPath}.gz`;
       }
-      
+
       switch (options.format || ExportFormat.JSON) {
         case ExportFormat.JSON:
           size = await this.exportAsJSON(processedChunks, outputPath, options.compress);
           break;
-          
+
         case ExportFormat.JSONL:
           size = await this.exportAsJSONL(processedChunks, outputPath, options.compress);
           break;
-          
+
         case ExportFormat.CSV:
           size = await this.exportAsCSV(processedChunks, outputPath, options.compress);
           break;
-          
+
         default:
           throw new Error(`Unsupported export format: ${options.format}`);
       }
-      
+
       return {
         path: outputPath,
         format: options.format || ExportFormat.JSON,
@@ -184,14 +184,14 @@ export class DataPortabilityManager {
           recoverable: false,
         })
       );
-      
+
       throw error;
     }
   }
-  
+
   /**
    * Import chunks from a file
-   * 
+   *
    * @param options - The import options
    * @returns The import result
    */
@@ -201,16 +201,16 @@ export class DataPortabilityManager {
       if (!fs.existsSync(options.inputPath)) {
         throw new Error(`Input file not found: ${options.inputPath}`);
       }
-      
+
       // Determine import format based on file extension
       const ext = path.extname(options.inputPath).toLowerCase();
       let format: ExportFormat;
       let inputPath = options.inputPath;
-      
+
       if (ext === '.gz') {
         // If file is compressed, get the original extension
         const baseExt = path.extname(path.basename(options.inputPath, ext)).toLowerCase();
-        
+
         if (baseExt === '.json') {
           format = ExportFormat.JSON;
         } else if (baseExt === '.jsonl') {
@@ -220,7 +220,7 @@ export class DataPortabilityManager {
         } else {
           throw new Error(`Unsupported import format: ${baseExt}`);
         }
-        
+
         // Set decompress to true if not specified
         if (options.decompress === undefined) {
           options.decompress = true;
@@ -234,30 +234,30 @@ export class DataPortabilityManager {
       } else {
         throw new Error(`Unsupported import format: ${ext}`);
       }
-      
+
       // Import chunks based on format
       let chunks: Chunk[];
-      
+
       switch (format) {
         case ExportFormat.JSON:
           chunks = await this.importFromJSON(inputPath, options.decompress);
           break;
-          
+
         case ExportFormat.JSONL:
           chunks = await this.importFromJSONL(inputPath, options.decompress);
           break;
-          
+
         case ExportFormat.CSV:
           chunks = await this.importFromCSV(inputPath, options.decompress);
           break;
-          
+
         default:
           throw new Error(`Unsupported import format: ${format}`);
       }
-      
+
       // Filter chunks if a filter is provided
       const filteredChunks = options.filter ? chunks.filter(options.filter) : chunks;
-      
+
       // Process chunks
       const result: ImportResult = {
         total: filteredChunks.length,
@@ -266,34 +266,34 @@ export class DataPortabilityManager {
         skipped: 0,
         errors: [],
       };
-      
+
       // Update bucket name and domain if provided
       if (options.bucketName || options.bucketDomain) {
         for (const chunk of filteredChunks) {
           if (options.bucketName) {
             chunk.metadata.bucketName = options.bucketName;
           }
-          
+
           if (options.bucketDomain) {
             chunk.metadata.domain = options.bucketDomain;
           }
         }
       }
-      
+
       // TODO: Generate embeddings if requested
       if (options.generateEmbeddings) {
         // This would require access to the embedding model
         // For now, we'll just log a warning
         console.warn('Generating embeddings is not implemented yet');
       }
-      
+
       // TODO: Generate summaries if requested
       if (options.generateSummaries) {
         // This would require access to the summarization engine
         // For now, we'll just log a warning
         console.warn('Generating summaries is not implemented yet');
       }
-      
+
       // Return the processed chunks and result
       return {
         ...result,
@@ -310,14 +310,14 @@ export class DataPortabilityManager {
           recoverable: false,
         })
       );
-      
+
       throw error;
     }
   }
-  
+
   /**
    * Export chunks as JSON
-   * 
+   *
    * @param chunks - The chunks to export
    * @param outputPath - The output file path
    * @param compress - Whether to compress the output
@@ -325,7 +325,7 @@ export class DataPortabilityManager {
    */
   private async exportAsJSON(chunks: Chunk[], outputPath: string, compress?: boolean): Promise<number> {
     const jsonData = JSON.stringify(chunks, null, 2);
-    
+
     if (compress) {
       await pipeline(
         Readable.from(jsonData),
@@ -335,14 +335,14 @@ export class DataPortabilityManager {
     } else {
       await fs.promises.writeFile(outputPath, jsonData);
     }
-    
+
     const stats = await fs.promises.stat(outputPath);
     return stats.size;
   }
-  
+
   /**
    * Export chunks as JSONL
-   * 
+   *
    * @param chunks - The chunks to export
    * @param outputPath - The output file path
    * @param compress - Whether to compress the output
@@ -350,7 +350,7 @@ export class DataPortabilityManager {
    */
   private async exportAsJSONL(chunks: Chunk[], outputPath: string, compress?: boolean): Promise<number> {
     const jsonlData = chunks.map(chunk => JSON.stringify(chunk)).join('\n');
-    
+
     if (compress) {
       await pipeline(
         Readable.from(jsonlData),
@@ -360,14 +360,14 @@ export class DataPortabilityManager {
     } else {
       await fs.promises.writeFile(outputPath, jsonlData);
     }
-    
+
     const stats = await fs.promises.stat(outputPath);
     return stats.size;
   }
-  
+
   /**
    * Export chunks as CSV
-   * 
+   *
    * @param chunks - The chunks to export
    * @param outputPath - The output file path
    * @param compress - Whether to compress the output
@@ -385,7 +385,7 @@ export class DataPortabilityManager {
       'embedding',
       'summaries',
     ];
-    
+
     // Convert chunks to CSV rows
     const rows = chunks.map(chunk => {
       return [
@@ -399,13 +399,13 @@ export class DataPortabilityManager {
         chunk.summaries.map(summary => `${summary.level}:${summary.content}`).join('||'),
       ];
     });
-    
+
     // Create CSV content
     const csvContent = [
       headers.join(','),
       ...rows.map(row => row.join(','))
     ].join('\n');
-    
+
     if (compress) {
       await pipeline(
         Readable.from(csvContent),
@@ -415,110 +415,110 @@ export class DataPortabilityManager {
     } else {
       await fs.promises.writeFile(outputPath, csvContent);
     }
-    
+
     const stats = await fs.promises.stat(outputPath);
     return stats.size;
   }
-  
+
   /**
    * Import chunks from JSON
-   * 
+   *
    * @param inputPath - The input file path
    * @param decompress - Whether to decompress the input
    * @returns The imported chunks
    */
   private async importFromJSON(inputPath: string, decompress?: boolean): Promise<Chunk[]> {
     let jsonData: string;
-    
+
     if (decompress) {
       // Create a temporary file to store the decompressed data
       const tempPath = `${inputPath}.temp`;
-      
+
       await pipeline(
         createReadStream(inputPath),
         createGunzip(),
         createWriteStream(tempPath)
       );
-      
+
       jsonData = await fs.promises.readFile(tempPath, 'utf-8');
-      
+
       // Clean up temporary file
       await fs.promises.unlink(tempPath);
     } else {
       jsonData = await fs.promises.readFile(inputPath, 'utf-8');
     }
-    
+
     return JSON.parse(jsonData) as Chunk[];
   }
-  
+
   /**
    * Import chunks from JSONL
-   * 
+   *
    * @param inputPath - The input file path
    * @param decompress - Whether to decompress the input
    * @returns The imported chunks
    */
   private async importFromJSONL(inputPath: string, decompress?: boolean): Promise<Chunk[]> {
     let jsonlData: string;
-    
+
     if (decompress) {
       // Create a temporary file to store the decompressed data
       const tempPath = `${inputPath}.temp`;
-      
+
       await pipeline(
         createReadStream(inputPath),
         createGunzip(),
         createWriteStream(tempPath)
       );
-      
+
       jsonlData = await fs.promises.readFile(tempPath, 'utf-8');
-      
+
       // Clean up temporary file
       await fs.promises.unlink(tempPath);
     } else {
       jsonlData = await fs.promises.readFile(inputPath, 'utf-8');
     }
-    
+
     return jsonlData
       .split('\n')
       .filter(line => line.trim())
       .map(line => JSON.parse(line) as Chunk);
   }
-  
+
   /**
    * Import chunks from CSV
-   * 
+   *
    * @param inputPath - The input file path
    * @param decompress - Whether to decompress the input
    * @returns The imported chunks
    */
   private async importFromCSV(inputPath: string, decompress?: boolean): Promise<Chunk[]> {
     let csvData: string;
-    
+
     if (decompress) {
       // Create a temporary file to store the decompressed data
       const tempPath = `${inputPath}.temp`;
-      
+
       await pipeline(
         createReadStream(inputPath),
         createGunzip(),
         createWriteStream(tempPath)
       );
-      
+
       csvData = await fs.promises.readFile(tempPath, 'utf-8');
-      
+
       // Clean up temporary file
       await fs.promises.unlink(tempPath);
     } else {
       csvData = await fs.promises.readFile(inputPath, 'utf-8');
     }
-    
+
     const lines = csvData.split('\n');
     const headers = lines[0].split(',');
-    
+
     return lines.slice(1).filter(line => line.trim()).map(line => {
       const values = this.parseCSVLine(line);
-      
+
       const chunk: Chunk = {
         id: values[0],
         content: values[1],
@@ -538,15 +538,21 @@ export class DataPortabilityManager {
             concepts: []
           };
         }) : [],
+        memory: {
+          weight: 1,
+          lastAccessedAt: values[3] || new Date().toISOString(),
+          accessCount: 0,
+          decayRate: 0.01,
+        },
       };
-      
+
       return chunk;
     });
   }
-  
+
   /**
    * Escape a string for CSV
-   * 
+   *
    * @param str - The string to escape
    * @returns The escaped string
    */
@@ -556,10 +562,10 @@ export class DataPortabilityManager {
     }
     return str;
   }
-  
+
   /**
    * Parse a CSV line
-   * 
+   *
    * @param line - The CSV line to parse
    * @returns The parsed values
    */
@@ -567,10 +573,10 @@ export class DataPortabilityManager {
     const result: string[] = [];
     let current = '';
     let inQuotes = false;
-    
+
     for (let i = 0; i < line.length; i++) {
       const char = line[i];
-      
+
       if (char === '"') {
         if (i < line.length - 1 && line[i + 1] === '"') {
           // Double quotes inside quotes
@@ -589,10 +595,10 @@ export class DataPortabilityManager {
         current += char;
       }
     }
-    
+
     // Add the last field
     result.push(current);
-    
+
     return result;
   }
 }
@@ -602,7 +608,7 @@ export const dataPortabilityManager = DataPortabilityManager.getInstance();
 
 /**
  * Utility function to export chunks
- * 
+ *
  * @param chunks - The chunks to export
  * @param options - The export options
  * @returns The export result
@@ -613,7 +619,7 @@ export function exportChunks(chunks: Chunk[], options: ExportOptions): Promise<E
 
 /**
  * Utility function to import chunks
- * 
+ *
  * @param options - The import options
  * @returns The import result
  */
