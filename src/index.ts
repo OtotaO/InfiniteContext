@@ -138,11 +138,10 @@ export class InfiniteContext {
     
     // Add Google Drive provider if requested
     if (options.addGoogleDrive && options.googleDriveCredentials) {
-      const googleDriveProvider = new GoogleDriveProvider(
-        'gdrive',
-        'Google Drive',
-        options.googleDriveCredentials
-      );
+      const googleDriveProvider = new GoogleDriveProvider(options.googleDriveCredentials, {
+        id: 'gdrive',
+        name: 'Google Drive',
+      });
       
       await googleDriveProvider.connect();
       this.memoryManager.addStorageProvider(googleDriveProvider);
