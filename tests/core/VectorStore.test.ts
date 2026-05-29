@@ -50,12 +50,12 @@ describe('VectorStore', () => {
       expect(vectorStore.size()).toBe(3);
     });
 
-    it('should throw an error if chunk embedding dimension does not match store dimension', () => {
+    it('should throw a clear error if chunk embedding dimension does not match store dimension', () => {
       const wrongDimensionChunk = createTestChunk(dimension + 1);
 
       expect(() => {
         vectorStore.addChunk(wrongDimensionChunk);
-      }).toThrow();
+      }).toThrow('Chunk embedding dimension mismatch: expected 5, received 6');
     });
   });
 
@@ -91,6 +91,20 @@ describe('VectorStore', () => {
       const results = emptyStore.search(queryVector);
 
       expect(results.length).toBe(0);
+    });
+
+    it('should preserve empty-store behavior before validating query dimensions', () => {
+      const emptyStore = new VectorStore(dimension);
+
+      expect(emptyStore.search([1, 0, 0])).toEqual([]);
+    });
+
+    it('should throw a clear error if query vector dimension does not match store dimension', () => {
+      const queryVector = [1, 0, 0];
+
+      expect(() => {
+        vectorStore.search(queryVector);
+      }).toThrow('Query vector dimension mismatch: expected 5, received 3');
     });
   });
 
