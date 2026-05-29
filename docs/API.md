@@ -630,9 +630,11 @@ Gets the number of chunks in the store.
 async save(path?: string): Promise<void>
 ```
 
-Saves the vector store to a file:
+Saves the vector store to files:
 
-- `path`: The path to save to (optional)
+- `path`: The base path to save to (optional)
+- Writes `<path>.json` with chunk payloads
+- Writes `<path>.index.json` with the persisted flat index artifact
 
 ##### load
 
@@ -640,9 +642,25 @@ Saves the vector store to a file:
 async load(path?: string): Promise<void>
 ```
 
-Loads the vector store from a file:
+Loads the vector store from files:
 
-- `path`: The path to load from (optional)
+- `path`: The base path to load from (optional)
+- Reads `<path>.json` and validates chunk dimensions
+- Reads `<path>.index.json` when present; missing or incompatible flat index artifacts are rebuilt from chunks
+
+### IndexManager
+
+Manages persisted vector index artifacts. The first functional release supports exact flat indexes only. Approximate `IndexType.HNSW` and `IndexType.IVF` values are reserved for future use and are rejected by rebuild, merge, split, and memory-estimation paths rather than returning fake success.
+
+#### Supported operations
+
+```typescript
+rebuildIndex(chunks: Chunk[], params: IndexParams, outputPath: string): Promise<boolean>
+mergeIndices(indexPaths: string[], outputPath: string, params: IndexParams): Promise<boolean>
+splitIndex(indexPath: string, outputDir: string, numShards: number, params: IndexParams): Promise<boolean>
+```
+
+All three operations require `params.type` to be `IndexType.FLAT`. A successful rebuild writes a JSON artifact with schema metadata, index parameters, indexed entries, and chunks. Merge and split read and write those same artifacts so users can verify files changed instead of trusting a boolean return value alone.
 
 ### MemoryMonitor
 

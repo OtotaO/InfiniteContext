@@ -19,7 +19,7 @@ InfiniteContext is a TypeScript library that provides a structured way to store,
 - **Data Integrity**: Verification and repair of data integrity to prevent corruption
 - **Backup & Recovery**: Automated backup and recovery of stored data
 - **Data Portability**: Export and import data in various formats (JSON, JSONL, CSV)
-- **Vector Index Optimization**: Automatic optimization of vector indices for performance
+- **Flat Vector Index Artifacts**: Exact, persisted vector indices for rebuild, merge, split, save, and load workflows
 - **Transaction Management**: Atomic operations with rollback capability
 
 ## Installation
@@ -124,7 +124,17 @@ graph TD
 - **IntegrityVerifier**: Verification and repair of data integrity
 - **BackupManager**: Automated backup and recovery of stored data
 - **DataPortability**: Export and import data in various formats
-- **IndexManager**: Optimization of vector indices for performance
+- **IndexManager**: Exact flat-index artifact management; approximate HNSW/IVF backends are reserved for a future release and fail explicitly if requested
+
+
+## Vector Index Support
+
+InfiniteContext's first functional release does **not** support approximate vector indexing. The built-in `VectorStore` performs exact in-memory search and persists two files when saved:
+
+- `<path>.json` for chunk payloads
+- `<path>.index.json` for a real flat index artifact containing indexed ids, positions, embeddings, and chunks
+
+`IndexManager` supports exact flat index rebuild, merge, split, save, and load artifact workflows. `IndexType.HNSW` and `IndexType.IVF` remain reserved enum values for future backends; operations using those types return `false` or throw through validation paths instead of reporting fake success.
 
 ## Storage Providers
 
@@ -286,30 +296,27 @@ await context.updateCategorizer();
 
 For more details, see the [Categorization documentation](docs/CATEGORIZATION.md).
 
-### Vector Index Optimization
+### Flat Vector Index Artifacts
 
 ```typescript
-// Get optimal index parameters
+// The first functional release always recommends the supported exact flat index.
 const params = await context.getOptimalIndexParams(
   chunks.length,
-  chunks[0].embedding.length,
-  1024 * 1024 * 1024 // 1GB memory budget
+  chunks[0].embedding.length
 );
 
-console.log(`Optimal index type: ${params.type}`);
+console.log(`Supported index type: ${params.type}`); // "flat"
 
-// Estimate memory usage
+// Estimate memory usage for the flat index.
 const memoryUsage = await context.estimateIndexMemoryUsage(params, chunks.length);
 console.log(`Estimated memory usage: ${memoryUsage / (1024 * 1024)} MB`);
 
-// Optimize an existing index
-const optimizedParams = await context.optimizeIndex(chunks, currentParams, {
-  targetMemoryUsage: 512 * 1024 * 1024, // 512MB
-  maxIndexSize: 1000000
-});
-
-// Rebuild the index with optimized parameters
-const rebuilt = await context.rebuildIndex(chunks, optimizedParams, './vector-indices/optimized.idx');
+// Rebuild writes an actual JSON artifact. HNSW/IVF requests are rejected until
+// approximate backends are implemented end-to-end.
+const rebuilt = await context.rebuildIndex(chunks, params, './vector-indices/chunks.flat-index.json');
+if (!rebuilt) {
+  throw new Error('Index rebuild failed');
+}
 ```
 
 ## Setup Guide for macOS

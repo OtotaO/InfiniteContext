@@ -1,11 +1,15 @@
 import { promises as fs } from 'fs';
 import { dirname } from 'path';
 import { Vector, SearchResult, Chunk } from './types.js';
+import { indexManager, IndexType } from '../utils/IndexManager.js';
 
 /**
  * Simple in-memory vector store implementation with basic search functionality.
- * This implementation uses brute-force search with cosine similarity, which is
- * not as efficient as HNSW but doesn't require native dependencies.
+ *
+ * The first functional release uses exact flat indexing. Save operations persist
+ * both the chunk payload and a real flat index artifact used by index-management
+ * utilities. Approximate backends such as HNSW are intentionally unsupported
+ * until they are wired into every rebuild, merge, split, save, and load path.
  */
 export class VectorStore {
   private dimension: number;
@@ -13,6 +17,26 @@ export class VectorStore {
   private chunks: Chunk[] = [];
   private dirty = false;
   private path?: string;
+
+  private getIndexPath(basePath: string): string {
+    return `${basePath}.index.json`;
+  }
+
+  private async persistIndexArtifact(basePath: string): Promise<void> {
+    const indexBuilt = await indexManager.rebuildIndex(
+      this.chunks,
+      {
+        type: IndexType.FLAT,
+        dimension: this.dimension,
+        metric: this.metric,
+      },
+      this.getIndexPath(basePath)
+    );
+
+    if (!indexBuilt) {
+      throw new Error('Failed to persist vector store index artifact');
+    }
+  }
 
   /**
    * Create a new VectorStore instance
@@ -78,6 +102,10 @@ export class VectorStore {
    * @returns The internal ID assigned to the chunk
    */
   public addChunk(chunk: Chunk): number {
+    if (chunk.embedding.length !== this.dimension) {
+      throw new Error(`Chunk embedding dimension ${chunk.embedding.length} does not match store dimension ${this.dimension}`);
+    }
+
     // Make sure the embedding is normalized if using cosine similarity
     if (this.metric === 'cosine') {
       chunk.embedding = this.normalizeVector([...chunk.embedding]);
@@ -146,9 +174,11 @@ export class VectorStore {
     // Save chunks
     await fs.writeFile(
       `${savePath}.json`,
-      JSON.stringify(this.chunks),
+      JSON.stringify(this.chunks, null, 2),
       'utf-8'
     );
+
+    await this.persistIndexArtifact(savePath);
 
     this.dirty = false;
   }
@@ -169,6 +199,22 @@ export class VectorStore {
         'utf-8'
       );
       this.chunks = JSON.parse(chunksData);
+
+      for (const chunk of this.chunks) {
+        if (chunk.embedding.length !== this.dimension) {
+          throw new Error(`Loaded chunk ${chunk.id} embedding dimension ${chunk.embedding.length} does not match store dimension ${this.dimension}`);
+        }
+      }
+
+      try {
+        const artifact = await indexManager.loadFlatIndex(this.getIndexPath(loadPath));
+        if (artifact.params.dimension !== this.dimension || artifact.params.metric !== this.metric || artifact.size !== this.chunks.length) {
+          await this.persistIndexArtifact(loadPath);
+        }
+      } catch {
+        await this.persistIndexArtifact(loadPath);
+      }
+
       this.dirty = false;
     } catch (error) {
       throw new Error(`Failed to load vector store: ${error}`);
