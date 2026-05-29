@@ -16,20 +16,23 @@ export class Bucket {
   private vectorStore: VectorStore;
   private subBuckets: Map<string, Bucket> = new Map();
   private parentId?: string;
+  private onChange?: () => void;
 
   /**
    * Create a new Bucket
    * 
    * @param config - The bucket configuration
    * @param vectorStore - Optional vector store to use (will create one if not provided)
+   * @param onChange - Optional callback invoked when bucket contents or hierarchy change
    */
-  constructor(config: BucketConfig, vectorStore?: VectorStore) {
+  constructor(config: BucketConfig, vectorStore?: VectorStore, onChange?: () => void) {
     this.id = config.id || uuidv4();
     this.name = config.name;
     this.domain = config.domain;
     this.description = config.description;
     this.parentId = config.parentId;
     this.vectorStore = vectorStore || new VectorStore();
+    this.onChange = onChange;
   }
 
   /**
@@ -61,6 +64,19 @@ export class Bucket {
   }
 
   /**
+   * Get this bucket's configuration for persistence.
+   */
+  public getConfig(): BucketConfig {
+    return {
+      id: this.id,
+      name: this.name,
+      domain: this.domain,
+      description: this.description,
+      parentId: this.parentId
+    };
+  }
+
+  /**
    * Get the parent bucket ID
    */
   public getParentId(): string | undefined {
@@ -76,7 +92,9 @@ export class Bucket {
   public addChunk(chunk: Chunk): number {
     // Ensure the chunk has the correct domain
     chunk.metadata.domain = this.domain;
-    return this.vectorStore.addChunk(chunk);
+    const id = this.vectorStore.addChunk(chunk);
+    this.onChange?.();
+    return id;
   }
 
   /**
@@ -90,7 +108,9 @@ export class Bucket {
     for (const chunk of chunks) {
       chunk.metadata.domain = this.domain;
     }
-    return this.vectorStore.addChunks(chunks);
+    const ids = this.vectorStore.addChunks(chunks);
+    this.onChange?.();
+    return ids;
   }
 
   /**
@@ -138,10 +158,28 @@ export class Bucket {
       parentId: this.id
     };
     
-    const subBucket = new Bucket(fullConfig);
+    const subBucket = new Bucket(fullConfig, undefined, this.onChange);
     this.subBuckets.set(subBucket.getId(), subBucket);
+    this.onChange?.();
     
     return subBucket;
+  }
+
+  /**
+   * Attach an existing bucket as a sub-bucket. Used when rebuilding persisted hierarchies.
+   *
+   * @param bucket - The bucket to attach
+   */
+  public addExistingSubBucket(bucket: Bucket): void {
+    this.subBuckets.set(bucket.getId(), bucket);
+    this.onChange?.();
+  }
+
+  /**
+   * Get chunks stored directly in this bucket, excluding sub-buckets.
+   */
+  public getChunks(): Chunk[] {
+    return this.vectorStore.getChunks();
   }
 
   /**
@@ -161,7 +199,11 @@ export class Bucket {
    * @returns True if the sub-bucket was removed, false if not found
    */
   public removeSubBucket(id: string): boolean {
-    return this.subBuckets.delete(id);
+    const removed = this.subBuckets.delete(id);
+    if (removed) {
+      this.onChange?.();
+    }
+    return removed;
   }
 
   /**
@@ -180,8 +222,10 @@ export class Bucket {
    * @returns An array of chunks
    */
   public getAllChunks(recursive: boolean = true): Chunk[] {
-    const chunks = this.vectorStore.getAllChunks();
-    
+    // Use the vector store's defensive-copy accessor so callers cannot mutate
+    // internal store state through returned chunk references.
+    const chunks: Chunk[] = this.vectorStore.getAllChunks();
+
     // Add chunks from sub-buckets if recursive
     if (recursive) {
       for (const subBucket of this.subBuckets.values()) {

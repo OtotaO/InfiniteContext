@@ -1,12 +1,43 @@
+import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { Bucket } from './Bucket.js';
 import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, Metadata, StorageTier, Vector } from './types.js';
 import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
-import { VectorStore } from './VectorStore.js';
 import path from 'path';
 import os from 'os';
+
+interface ManifestProvider {
+  id: string;
+  name: string;
+  tier: StorageTier;
+  type: 'local' | 'external';
+  basePath?: string;
+  maxSizeBytes?: number;
+}
+
+interface ManifestBucket {
+  config: BucketConfig;
+  chunkIds: string[];
+  subBuckets: ManifestBucket[];
+}
+
+interface ManifestChunk {
+  id: string;
+  bucketId?: string;
+  location: ChunkLocation;
+  healthy: boolean;
+  unhealthyReason?: string;
+}
+
+interface MemoryManifest {
+  version: 1;
+  updatedAt: string;
+  providers: ManifestProvider[];
+  buckets: ManifestBucket[];
+  chunks: ManifestChunk[];
+}
 
 /**
  * The MemoryManager is the main entry point for the InfiniteContext system.
@@ -16,10 +47,14 @@ export class MemoryManager {
   private rootBuckets: Map<string, Bucket> = new Map();
   private storageProviders: Map<string, StorageProvider> = new Map();
   private chunkLocations: Map<string, ChunkLocation> = new Map();
+  private unhealthyChunkLocations: Map<string, { location: ChunkLocation; reason: string }> = new Map();
   private embeddingFunction?: (text: string) => Promise<Vector>;
   private basePath: string;
+  private manifestPath: string;
   private memoryMonitor: MemoryMonitor;
   private alertHandlers: Array<(alert: MemoryAlert) => void> = [];
+  private isInitializing = false;
+  private manifestSaveQueue: Promise<void> = Promise.resolve();
 
   /**
    * Create a new MemoryManager
@@ -37,6 +72,7 @@ export class MemoryManager {
     }>;
   } = {}) {
     this.basePath = options.basePath || path.join(os.homedir(), '.infinite-context');
+    this.manifestPath = path.join(this.basePath, 'manifest.json');
     this.embeddingFunction = options.embeddingFunction;
     
     // Initialize memory monitor
@@ -54,14 +90,26 @@ export class MemoryManager {
   public async initialize(options: {
     localStoragePath?: string;
   } = {}): Promise<void> {
-    // Set up default storage provider (local filesystem)
-    const localStoragePath = options.localStoragePath || path.join(this.basePath, 'storage');
-    const localProvider = new LocalStorageProvider(localStoragePath, {
-      id: 'local',
-      name: 'Local Storage',
-    });
-    await localProvider.connect();
-    this.addStorageProvider(localProvider);
+    this.isInitializing = true;
+
+    try {
+      await fs.mkdir(this.basePath, { recursive: true });
+
+      // Set up default storage provider (local filesystem)
+      const localStoragePath = options.localStoragePath || path.join(this.basePath, 'storage');
+      const localProvider = new LocalStorageProvider(localStoragePath, {
+        id: 'local',
+        name: 'Local Storage',
+      });
+      await localProvider.connect();
+      this.addStorageProvider(localProvider);
+
+      await this.loadManifest();
+    } finally {
+      this.isInitializing = false;
+    }
+
+    await this.saveManifest();
   }
 
   /**
@@ -78,6 +126,7 @@ export class MemoryManager {
     }
     
     this.storageProviders.set(id, provider);
+    this.persistManifestInBackground();
     return true;
   }
 
@@ -98,7 +147,20 @@ export class MemoryManager {
    * @returns True if the provider was removed, false if not found
    */
   public removeStorageProvider(id: string): boolean {
-    return this.storageProviders.delete(id);
+    const removed = this.storageProviders.delete(id);
+    if (removed) {
+      for (const [chunkId, location] of this.chunkLocations.entries()) {
+        if (location.providerId === id) {
+          this.chunkLocations.delete(chunkId);
+          this.unhealthyChunkLocations.set(chunkId, {
+            location,
+            reason: `Storage provider ${id} was removed`
+          });
+        }
+      }
+      this.persistManifestInBackground();
+    }
+    return removed;
   }
 
   /**
@@ -122,8 +184,9 @@ export class MemoryManager {
       ...config
     };
     
-    const bucket = new Bucket(fullConfig);
+    const bucket = new Bucket(fullConfig, undefined, () => this.persistManifestInBackground());
     this.rootBuckets.set(bucket.getId(), bucket);
+    this.persistManifestInBackground();
     
     return bucket;
   }
@@ -145,7 +208,18 @@ export class MemoryManager {
    * @returns True if the bucket was removed, false if not found
    */
   public removeBucket(id: string): boolean {
-    return this.rootBuckets.delete(id);
+    const bucket = this.rootBuckets.get(id);
+    const removed = this.rootBuckets.delete(id);
+
+    if (removed && bucket) {
+      for (const chunk of bucket.getAllChunks(true)) {
+        this.chunkLocations.delete(chunk.id);
+        this.unhealthyChunkLocations.delete(chunk.id);
+      }
+      this.persistManifestInBackground();
+    }
+
+    return removed;
   }
 
   /**
@@ -205,6 +279,8 @@ export class MemoryManager {
           
           // Remember where the chunk is stored
           this.chunkLocations.set(chunk.id, location);
+          this.unhealthyChunkLocations.delete(chunk.id);
+          await this.saveManifest();
           
           return location;
         }
@@ -224,6 +300,11 @@ export class MemoryManager {
    * @returns The retrieved chunk
    */
   public async retrieveChunk(chunkId: string): Promise<Chunk> {
+    const unhealthy = this.unhealthyChunkLocations.get(chunkId);
+    if (unhealthy) {
+      throw new Error(`Chunk ${chunkId} is unhealthy: ${unhealthy.reason}`);
+    }
+
     const location = this.chunkLocations.get(chunkId);
     
     if (!location) {
@@ -233,6 +314,7 @@ export class MemoryManager {
     const provider = this.storageProviders.get(location.providerId);
     
     if (!provider) {
+      this.markChunkUnhealthy(chunkId, location, `Storage provider not found for ID: ${location.providerId}`);
       throw new Error(`Storage provider not found for ID: ${location.providerId}`);
     }
     
@@ -243,6 +325,7 @@ export class MemoryManager {
     try {
       return JSON.parse(serializedChunk.toString('utf-8')) as Chunk;
     } catch (error) {
+      this.markChunkUnhealthy(chunkId, location, `Failed to deserialize chunk: ${error}`);
       throw new Error(`Failed to deserialize chunk: ${error}`);
     }
   }
@@ -317,13 +400,6 @@ export class MemoryManager {
     return [summary];
   }
 
-  /**
-   * Find the most relevant buckets for a query
-   * 
-   * @param query - The query text or vector
-   * @param k - The number of buckets to return
-   * @returns The most relevant buckets with scores
-   */
   /**
    * Add a memory alert handler
    * 
@@ -452,5 +528,222 @@ export class MemoryManager {
     results.sort((a, b) => b.score - a.score);
     
     return results.slice(0, k);
+  }
+
+  private persistManifestInBackground(): void {
+    if (this.isInitializing) {
+      return;
+    }
+
+    this.manifestSaveQueue = this.manifestSaveQueue
+      .then(() => this.writeManifest())
+      .catch((error) => {
+        console.warn(`Failed to persist memory manifest: ${error}`);
+      });
+  }
+
+  private async saveManifest(): Promise<void> {
+    if (this.isInitializing) {
+      return;
+    }
+
+    this.manifestSaveQueue = this.manifestSaveQueue.then(() => this.writeManifest());
+    await this.manifestSaveQueue;
+  }
+
+  private async writeManifest(): Promise<void> {
+    await fs.mkdir(this.basePath, { recursive: true });
+
+    const manifest = this.createManifest();
+    const tempPath = `${this.manifestPath}.tmp`;
+    await fs.writeFile(tempPath, JSON.stringify(manifest, null, 2), 'utf-8');
+    await fs.rename(tempPath, this.manifestPath);
+  }
+
+  private createManifest(): MemoryManifest {
+    const bucketChunkIds = new Map<string, string>();
+    const buckets = Array.from(this.rootBuckets.values()).map((bucket) => this.serializeBucket(bucket, bucketChunkIds));
+    const chunks: ManifestChunk[] = [];
+
+    for (const [id, location] of this.chunkLocations.entries()) {
+      chunks.push({
+        id,
+        bucketId: bucketChunkIds.get(id),
+        location,
+        healthy: true
+      });
+    }
+
+    for (const [id, unhealthy] of this.unhealthyChunkLocations.entries()) {
+      chunks.push({
+        id,
+        bucketId: bucketChunkIds.get(id),
+        location: unhealthy.location,
+        healthy: false,
+        unhealthyReason: unhealthy.reason
+      });
+    }
+
+    return {
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      providers: Array.from(this.storageProviders.values()).map((provider) => this.serializeProvider(provider)),
+      buckets,
+      chunks
+    };
+  }
+
+  private serializeProvider(provider: StorageProvider): ManifestProvider {
+    const base: ManifestProvider = {
+      id: provider.getId(),
+      name: provider.getName(),
+      tier: provider.getTier(),
+      type: 'external'
+    };
+
+    if (provider instanceof LocalStorageProvider) {
+      return {
+        ...base,
+        type: 'local',
+        basePath: provider.getBasePath(),
+        maxSizeBytes: provider.getMaxSizeBytes()
+      };
+    }
+
+    return base;
+  }
+
+  private serializeBucket(bucket: Bucket, bucketChunkIds: Map<string, string>): ManifestBucket {
+    const chunkIds = bucket.getChunks().map((chunk) => {
+      bucketChunkIds.set(chunk.id, bucket.getId());
+      return chunk.id;
+    });
+
+    return {
+      config: bucket.getConfig(),
+      chunkIds,
+      subBuckets: Array.from(bucket.getSubBuckets().values()).map((subBucket) => this.serializeBucket(subBucket, bucketChunkIds))
+    };
+  }
+
+  private async loadManifest(): Promise<void> {
+    let manifest: MemoryManifest;
+
+    try {
+      const manifestData = await fs.readFile(this.manifestPath, 'utf-8');
+      manifest = JSON.parse(manifestData) as MemoryManifest;
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') {
+        return;
+      }
+      console.warn(`Failed to load memory manifest; starting without persisted metadata: ${error}`);
+      return;
+    }
+
+    if (!manifest || manifest.version !== 1) {
+      console.warn('Unsupported memory manifest version; starting without persisted metadata');
+      return;
+    }
+
+    await this.restoreManifestProviders(manifest.providers || []);
+
+    const restoredBuckets = new Map<string, Bucket>();
+    const rootBuckets = new Map<string, Bucket>();
+    for (const manifestBucket of manifest.buckets || []) {
+      const bucket = this.deserializeBucket(manifestBucket, restoredBuckets);
+      rootBuckets.set(bucket.getId(), bucket);
+    }
+
+    this.rootBuckets = rootBuckets;
+    this.chunkLocations.clear();
+    this.unhealthyChunkLocations.clear();
+
+    const bucketChunkIds = new Map<string, string>();
+    for (const manifestBucket of manifest.buckets || []) {
+      this.collectManifestBucketChunkIds(manifestBucket, bucketChunkIds);
+    }
+
+    for (const manifestChunk of manifest.chunks || []) {
+      const chunkBucketId = manifestChunk.bucketId || bucketChunkIds.get(manifestChunk.id);
+      const bucket = chunkBucketId ? restoredBuckets.get(chunkBucketId) : undefined;
+      await this.restoreManifestChunk(manifestChunk, bucket);
+    }
+  }
+
+  private async restoreManifestProviders(providers: ManifestProvider[]): Promise<void> {
+    for (const provider of providers) {
+      if (this.storageProviders.has(provider.id)) {
+        continue;
+      }
+
+      if (provider.type === 'local' && provider.basePath) {
+        const localProvider = new LocalStorageProvider(provider.basePath, {
+          id: provider.id,
+          name: provider.name,
+          maxSizeBytes: provider.maxSizeBytes,
+        });
+        await localProvider.connect();
+        this.storageProviders.set(provider.id, localProvider);
+      }
+    }
+  }
+
+  private deserializeBucket(manifestBucket: ManifestBucket, allBuckets: Map<string, Bucket>): Bucket {
+    const bucket = new Bucket(manifestBucket.config, undefined, () => this.persistManifestInBackground());
+    allBuckets.set(bucket.getId(), bucket);
+
+    for (const manifestSubBucket of manifestBucket.subBuckets || []) {
+      const subBucket = this.deserializeBucket(manifestSubBucket, allBuckets);
+      bucket.addExistingSubBucket(subBucket);
+    }
+
+    return bucket;
+  }
+
+  private collectManifestBucketChunkIds(manifestBucket: ManifestBucket, bucketChunkIds: Map<string, string>): void {
+    for (const chunkId of manifestBucket.chunkIds || []) {
+      bucketChunkIds.set(chunkId, manifestBucket.config.id);
+    }
+
+    for (const subBucket of manifestBucket.subBuckets || []) {
+      this.collectManifestBucketChunkIds(subBucket, bucketChunkIds);
+    }
+  }
+
+  private async restoreManifestChunk(manifestChunk: ManifestChunk, bucket?: Bucket): Promise<void> {
+    const location = manifestChunk.location;
+    const provider = this.storageProviders.get(location.providerId);
+
+    if (!provider) {
+      this.markChunkUnhealthy(manifestChunk.id, location, `Storage provider not found for ID: ${location.providerId}`);
+      return;
+    }
+
+    try {
+      if (!(await provider.isConnected())) {
+        this.markChunkUnhealthy(manifestChunk.id, location, `Storage provider ${location.providerId} is not connected`);
+        return;
+      }
+
+      if (!(await provider.exists(location))) {
+        this.markChunkUnhealthy(manifestChunk.id, location, 'Stored chunk file is missing');
+        return;
+      }
+
+      const serializedChunk = await provider.retrieve(location);
+      const chunk = JSON.parse(serializedChunk.toString('utf-8')) as Chunk;
+
+      this.chunkLocations.set(manifestChunk.id, location);
+      if (bucket) {
+        bucket.addChunk(chunk);
+      }
+    } catch (error) {
+      this.markChunkUnhealthy(manifestChunk.id, location, `Failed to restore chunk: ${error}`);
+    }
+  }
+
+  private markChunkUnhealthy(chunkId: string, location: ChunkLocation, reason: string): void {
+    this.chunkLocations.delete(chunkId);
+    this.unhealthyChunkLocations.set(chunkId, { location, reason });
   }
 }

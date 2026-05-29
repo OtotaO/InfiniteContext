@@ -170,6 +170,13 @@ export class VectorStore {
   }
 
   /**
+   * Get a copy of all chunks in insertion order.
+   */
+  public getChunks(): Chunk[] {
+    return [...this.chunks];
+  }
+
+  /**
    * Get the number of chunks in the store
    */
   public size(): number {
