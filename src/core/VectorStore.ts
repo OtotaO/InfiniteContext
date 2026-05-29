@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import { dirname } from 'path';
-import { Vector, SearchResult, Chunk, MemoryFeedback, MemoryMetadata } from './types.js';
+import { Vector, SearchResult, Chunk, MemoryFeedback, MemoryMetadata, DeletionStatus } from './types.js';
 import { indexManager, IndexType } from '../utils/IndexManager.js';
 
 /**
@@ -19,6 +19,12 @@ export class VectorStore {
   private static readonly DAY_MS = 24 * 60 * 60 * 1000;
 
   private dimension: number;
+  /**
+   * When no explicit dimension is supplied, the store adopts the dimension of
+   * the first chunk it sees. This lets MemoryManager-created buckets work with
+   * any embedding function size while still validating consistency thereafter.
+   */
+  private autoDimension: boolean;
   private metric: 'cosine' | 'euclidean' | 'dot';
   private chunks: Chunk[] = [];
   private dirty = false;
@@ -52,13 +58,25 @@ export class VectorStore {
    * @param path - Optional path for persistence
    */
   constructor(
-    dimension: number = 1536,
+    dimension?: number,
     metric: 'cosine' | 'euclidean' | 'dot' = 'cosine',
     path?: string
   ) {
-    this.dimension = dimension;
+    this.autoDimension = dimension === undefined;
+    this.dimension = dimension ?? 1536;
     this.metric = metric;
     this.path = path;
+  }
+
+  /**
+   * Adopt the dimension from the first observed vector when running in
+   * auto-dimension mode (no explicit dimension was configured).
+   */
+  private adoptDimensionIfNeeded(vector: Vector): void {
+    if (this.autoDimension && this.chunks.length === 0 && vector.length > 0) {
+      this.dimension = vector.length;
+      this.autoDimension = false;
+    }
   }
 
   /**
@@ -196,6 +214,7 @@ export class VectorStore {
    * @returns The internal ID assigned to the chunk
    */
   public addChunk(chunk: Chunk): number {
+    this.adoptDimensionIfNeeded(chunk.embedding);
     this.validateDimension(chunk.embedding, 'Chunk embedding');
 
     const storedChunk = this.cloneChunk(chunk);
@@ -226,15 +245,19 @@ export class VectorStore {
    * Get every chunk in insertion order.
    *
    * Returned chunks are defensive copies, so mutating them will not affect the
-   * chunks held by this vector store.
+   * chunks held by this vector store. Deleted chunks are excluded unless
+   * `includeDeleted` is set.
    *
+   * @param includeDeleted - Whether to include chunks marked as deleted
    * @returns A copy of all stored chunks
    */
-  public getAllChunks(): Chunk[] {
-    return this.chunks.map(chunk => {
-      this.ensureMemoryMetadata(chunk);
-      return this.cloneChunk(chunk);
-    });
+  public getAllChunks(includeDeleted: boolean = false): Chunk[] {
+    return this.chunks
+      .filter(chunk => includeDeleted || chunk.metadata.deletionStatus !== DeletionStatus.DELETED)
+      .map(chunk => {
+        this.ensureMemoryMetadata(chunk);
+        return this.cloneChunk(chunk);
+      });
   }
 
   /**
@@ -253,12 +276,14 @@ export class VectorStore {
 
     const now = new Date();
 
-    // Calculate scores from semantic similarity and decayed memory weight.
-    const results = this.chunks.map((chunk, id) => ({
-      chunk,
-      score: this.calculateRetrievalScore(queryVector, chunk, now),
-      id
-    }));
+    // Exclude deleted memories, then score by semantic similarity blended with
+    // decayed memory weight.
+    const results = this.chunks
+      .filter(chunk => chunk.metadata.deletionStatus !== DeletionStatus.DELETED)
+      .map(chunk => ({
+        chunk,
+        score: this.calculateRetrievalScore(queryVector, chunk, now),
+      }));
 
     // Sort by score (descending)
     results.sort((a, b) => b.score - a.score);
@@ -333,10 +358,24 @@ export class VectorStore {
   }
 
   /**
+   * Replace a chunk by ID.
+   */
+  public updateChunk(chunk: Chunk): boolean {
+    const index = this.chunks.findIndex(existing => existing.id === chunk.id);
+    if (index === -1) {
+      return false;
+    }
+
+    this.chunks[index] = chunk;
+    this.dirty = true;
+    return true;
+  }
+
+  /**
    * Get the number of chunks in the store
    */
-  public size(): number {
-    return this.chunks.length;
+  public size(includeDeleted: boolean = true): number {
+    return this.getAllChunks(includeDeleted).length;
   }
 
   /**
@@ -379,6 +418,12 @@ export class VectorStore {
         'utf-8'
       );
       this.chunks = JSON.parse(chunksData) as Chunk[];
+
+      // Adopt dimension from persisted data when running in auto-dimension mode.
+      if (this.autoDimension && this.chunks.length > 0 && this.chunks[0].embedding.length > 0) {
+        this.dimension = this.chunks[0].embedding.length;
+        this.autoDimension = false;
+      }
 
       for (const chunk of this.chunks) {
         if (chunk.embedding.length !== this.dimension) {

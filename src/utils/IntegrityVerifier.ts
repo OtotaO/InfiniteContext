@@ -58,15 +58,59 @@ export class IntegrityVerifier {
     // Hash the embedding
     hash.update(chunk.embedding.join(','));
     
-    // Hash the metadata
-    hash.update(JSON.stringify(chunk.metadata));
+    // Hash metadata without the stored hash field so manifests cannot bless themselves.
+    const { hash: _hash, ...metadataWithoutHash } = chunk.metadata as any;
+    hash.update(JSON.stringify(metadataWithoutHash));
     
     // Hash the summaries
-    hash.update(chunk.summaries.join('|'));
+    hash.update(JSON.stringify(chunk.summaries));
     
     return hash.digest('hex');
   }
   
+
+  /**
+   * Calculate a deterministic hash over a persisted manifest object.
+   */
+  public calculateManifestHash(manifest: Record<string, any>): string {
+    const { integrityHash: _integrityHash, ...manifestWithoutHash } = manifest;
+    return crypto
+      .createHash('sha256')
+      .update(JSON.stringify(this.sortObject(manifestWithoutHash)))
+      .digest('hex');
+  }
+
+  /**
+   * Verify a persisted manifest has not been changed after its hash was recorded.
+   */
+  public verifyManifest(manifest: Record<string, any>): VerificationResult {
+    const errors: VerificationError[] = [];
+    if (!manifest.integrityHash) {
+      errors.push({ type: 'MISSING_MANIFEST_HASH', message: 'Manifest is missing an integrity hash' });
+    } else {
+      const currentHash = this.calculateManifestHash(manifest);
+      if (currentHash !== manifest.integrityHash) {
+        errors.push({
+          type: 'MANIFEST_HASH_MISMATCH',
+          message: 'Manifest hash does not match stored hash',
+          details: { currentHash, storedHash: manifest.integrityHash },
+        });
+      }
+    }
+    return { isValid: errors.length === 0, errors };
+  }
+
+  private sortObject(value: any): any {
+    if (Array.isArray(value)) return value.map(item => this.sortObject(item));
+    if (value && typeof value === 'object') {
+      return Object.keys(value).sort().reduce((acc, key) => {
+        acc[key] = this.sortObject(value[key]);
+        return acc;
+      }, {} as Record<string, any>);
+    }
+    return value;
+  }
+
   /**
    * Verify the integrity of a chunk
    * 
@@ -339,4 +383,12 @@ export function verifyChunk(chunk: Chunk, storedHash: string): VerificationResul
  */
 export function repairChunk(chunk: Chunk, verificationResult: VerificationResult): Chunk | null {
   return integrityVerifier.repairChunk(chunk, verificationResult);
+}
+
+export function calculateManifestHash(manifest: Record<string, any>): string {
+  return IntegrityVerifier.getInstance().calculateManifestHash(manifest);
+}
+
+export function verifyManifest(manifest: Record<string, any>): VerificationResult {
+  return IntegrityVerifier.getInstance().verifyManifest(manifest);
 }

@@ -90,8 +90,11 @@ export class Bucket {
    * @returns The ID of the chunk in the vector store
    */
   public addChunk(chunk: Chunk): number {
-    // Ensure the chunk has the correct domain
+    // Ensure the chunk has the correct domain and bucket identifiers
     chunk.metadata.domain = this.domain;
+    chunk.metadata.bucket = this.name;
+    chunk.metadata.bucketId = this.id;
+    chunk.metadata.bucketName = this.name;
     this.prepareChunkForHierarchy(chunk);
     const id = this.vectorStore.addChunk(chunk);
     this.onChange?.();
@@ -106,6 +109,9 @@ export class Bucket {
    */
   public addChunks(chunks: Chunk[]): number[] {
     for (const chunk of chunks) {
+      chunk.metadata.bucket = this.name;
+      chunk.metadata.bucketId = this.id;
+      chunk.metadata.bucketName = this.name;
       this.prepareChunkForHierarchy(chunk);
     }
     const ids = this.vectorStore.addChunks(chunks);
@@ -248,21 +254,42 @@ export class Bucket {
    * Get a flat array of all chunks in this bucket and optionally sub-buckets
    *
    * @param recursive - Whether to include chunks from sub-buckets
+   * @param includeDeleted - Whether to include chunks marked as deleted
    * @returns An array of chunks
    */
-  public getAllChunks(recursive: boolean = true): Chunk[] {
+  public getAllChunks(recursive: boolean = true, includeDeleted: boolean = false): Chunk[] {
     // Use the vector store's defensive-copy accessor so callers cannot mutate
     // internal store state through returned chunk references.
-    const chunks: Chunk[] = this.vectorStore.getAllChunks();
+    const chunks: Chunk[] = this.vectorStore.getAllChunks(includeDeleted);
 
     // Add chunks from sub-buckets if recursive
     if (recursive) {
       for (const subBucket of this.subBuckets.values()) {
-        chunks.push(...subBucket.getAllChunks(true));
+        chunks.push(...subBucket.getAllChunks(true, includeDeleted));
       }
     }
 
     return chunks;
+  }
+
+
+  /**
+   * Update a chunk stored in this bucket or any descendant bucket.
+   */
+  public updateChunk(chunk: Chunk, recursive: boolean = true): boolean {
+    if (this.vectorStore.updateChunk(chunk)) {
+      return true;
+    }
+
+    if (recursive) {
+      for (const subBucket of this.subBuckets.values()) {
+        if (subBucket.updateChunk(chunk, true)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   /**

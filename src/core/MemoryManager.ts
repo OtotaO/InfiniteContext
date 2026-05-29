@@ -1,13 +1,14 @@
 import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { Bucket } from './Bucket.js';
-import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, HierarchicalSearchResponse, Metadata, SearchResult, StorageTier, UserProfileMemory, UserProfileMemoryField, UserProfileMemoryFieldCategory, UserProfilePrivacySettings, UserProfileSnippet, Vector } from './types.js';
+import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, HierarchicalSearchResponse, Metadata, SearchResult, StorageTier, UserProfileMemory, UserProfileMemoryField, UserProfileMemoryFieldCategory, UserProfilePrivacySettings, UserProfileSnippet, DeletionStatus, MemoryMutationResult, MemoryQuery, ProfileMemory, Vector } from './types.js';
 import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
 import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './HierarchicalRetriever.js';
 import path from 'path';
 import os from 'os';
+import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, sanitizeChunkForExport } from '../utils/MemorySafety.js';
 
 interface ManifestProvider {
   id: string;
@@ -56,6 +57,8 @@ export class MemoryManager {
     disabledFields: [],
     disabledFieldKeys: [],
   };
+  // Safety-controlled key/value profile memories (retention, redaction, deletion).
+  private safetyProfileMemories: Map<string, ProfileMemory> = new Map();
   private embeddingFunction?: (text: string) => Promise<Vector>;
   private basePath: string;
   private manifestPath: string;
@@ -523,6 +526,7 @@ export class MemoryManager {
         // Check if there's enough space
         const quota = await provider.getQuota();
 
+        chunk.metadata.hash = await this.calculateChunkHash(chunk);
         // Serialize the chunk
         const serializedChunk = Buffer.from(JSON.stringify(chunk));
 
@@ -576,7 +580,15 @@ export class MemoryManager {
 
     // Deserialize the chunk
     try {
-      return JSON.parse(serializedChunk.toString('utf-8')) as Chunk;
+      const chunk = JSON.parse(serializedChunk.toString('utf-8')) as Chunk;
+      const storedHash = chunk.metadata.hash as string | undefined;
+      if (storedHash) {
+        const currentHash = await this.calculateChunkHash({ ...chunk, metadata: { ...chunk.metadata, hash: undefined } });
+        if (currentHash !== storedHash) {
+          throw new Error(`Stored chunk integrity check failed for ID: ${chunkId}`);
+        }
+      }
+      return chunk;
     } catch (error) {
       this.markChunkUnhealthy(chunkId, location, `Failed to deserialize chunk: ${error}`);
       throw new Error(`Failed to deserialize chunk: ${error}`);
@@ -626,6 +638,7 @@ export class MemoryManager {
         domain,
         source,
         tags,
+        ...defaultRetentionFields(),
         ...metadata
       },
       summaries,
@@ -638,6 +651,99 @@ export class MemoryManager {
     };
 
     return chunk;
+  }
+
+
+  /**
+   * Create or update a profile memory with retention metadata.
+   */
+  public upsertProfileMemory(memory: Omit<ProfileMemory, 'id' | 'createdAt' | 'updatedAt' | 'retentionPolicy' | 'sensitivity' | 'deletionStatus'> & Partial<Pick<ProfileMemory, 'id' | 'createdAt' | 'retentionPolicy' | 'sensitivity' | 'deletionStatus'>>): ProfileMemory {
+    const existing = memory.id ? this.safetyProfileMemories.get(memory.id) : undefined;
+    const now = new Date().toISOString();
+    const profileMemory: ProfileMemory = {
+      ...defaultRetentionFields(),
+      ...existing,
+      ...memory,
+      id: memory.id || existing?.id || uuidv4(),
+      tags: memory.tags || existing?.tags || [],
+      createdAt: memory.createdAt || existing?.createdAt || now,
+      updatedAt: now,
+    };
+
+    this.safetyProfileMemories.set(profileMemory.id, profileMemory);
+    return profileMemory;
+  }
+
+  /**
+   * List chunk and profile memories matching safety filters.
+   */
+  public listMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+    const chunks = Array.from(this.rootBuckets.values())
+      .flatMap(bucket => bucket.getAllChunks(true, true))
+      .filter(chunk => memoryMatchesQuery(chunk, query));
+    const profileMemories = Array.from(this.safetyProfileMemories.values())
+      .filter(memory => memoryMatchesQuery(memory, query));
+    return { chunks, profileMemories };
+  }
+
+  /**
+   * Redact matching memories while preserving tombstones for auditability.
+   */
+  public redactMemories(query: MemoryQuery, reason?: string): MemoryMutationResult {
+    return this.mutateMemories(query, chunk => redactChunk(chunk, reason), memory => redactProfileMemory(memory, reason));
+  }
+
+  /**
+   * Mark matching memories deleted while retaining deletion markers.
+   */
+  public deleteMemories(query: MemoryQuery, reason?: string): MemoryMutationResult {
+    return this.mutateMemories({ ...query, includeDeleted: true }, chunk => deleteChunkMarker(chunk, reason), memory => deleteProfileMemoryMarker(memory, reason));
+  }
+
+  /**
+   * Export matching memories with redacted/deleted records sanitized.
+   */
+  public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+    const memories = this.listMemories({ ...query, includeDeleted: query.includeDeleted ?? false });
+    return {
+      chunks: memories.chunks
+        .map(chunk => sanitizeChunkForExport(chunk, !!query.includeDeleted))
+        .filter((chunk): chunk is Chunk => chunk !== null),
+      profileMemories: memories.profileMemories.map(memory => {
+        if (memory.deletionStatus === DeletionStatus.REDACTED || memory.deletionStatus === DeletionStatus.DELETED) {
+          return redactProfileMemory(memory, memory.deletionReason);
+        }
+        return { ...memory };
+      }),
+    };
+  }
+
+  private mutateMemories(query: MemoryQuery, chunkMutator: (chunk: Chunk) => Chunk, profileMutator: (memory: ProfileMemory) => ProfileMemory): MemoryMutationResult {
+    let matched = 0;
+    let changed = 0;
+
+    for (const bucket of this.rootBuckets.values()) {
+      for (const chunk of bucket.getAllChunks(true, true)) {
+        if (!memoryMatchesQuery(chunk, query)) continue;
+        matched++;
+        const updated = chunkMutator(chunk);
+        if (bucket.updateChunk(updated, true)) changed++;
+      }
+    }
+
+    for (const memory of this.safetyProfileMemories.values()) {
+      if (!memoryMatchesQuery(memory, query)) continue;
+      matched++;
+      this.safetyProfileMemories.set(memory.id, profileMutator(memory));
+      changed++;
+    }
+
+    return { matched, changed };
+  }
+
+  private async calculateChunkHash(chunk: Chunk): Promise<string> {
+    const { calculateChunkHash } = await import('../utils/IntegrityVerifier.js');
+    return calculateChunkHash(chunk);
   }
 
   /**
