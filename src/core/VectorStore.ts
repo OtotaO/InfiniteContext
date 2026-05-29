@@ -78,6 +78,10 @@ export class VectorStore {
    * @returns The internal ID assigned to the chunk
    */
   public addChunk(chunk: Chunk): number {
+    if (chunk.embedding.length !== this.dimension) {
+      throw new Error(`Chunk embedding dimension ${chunk.embedding.length} does not match store dimension ${this.dimension}`);
+    }
+
     // Make sure the embedding is normalized if using cosine similarity
     if (this.metric === 'cosine') {
       chunk.embedding = this.normalizeVector([...chunk.embedding]);

@@ -24,6 +24,7 @@ constructor(options: {
   openai?: OpenAI;
   embeddingModel?: string;
   llmModel?: string;
+  profileMemory?: Partial<UserProfilePrivacySettings>;
   googleDriveCredentials?: {
     clientId: string;
     clientSecret: string;
@@ -39,6 +40,7 @@ Creates a new InfiniteContext instance with the specified options:
 - `openai`: An instance of the OpenAI client for embeddings and summarization
 - `embeddingModel`: The OpenAI embedding model to use (default: `text-embedding-3-small`)
 - `llmModel`: The OpenAI language model to use (default: `gpt-3.5-turbo`)
+- `profileMemory`: Privacy settings for profile memory extraction and storage
 - `googleDriveCredentials`: Credentials for Google Drive integration
 
 #### Methods
@@ -82,6 +84,10 @@ async storeContent(
     metadata?: Partial<Omit<Metadata, 'id' | 'timestamp'>>;
     summarize?: boolean;
     preferredTier?: StorageTier;
+    extractProfile?: boolean;
+    userId?: string;
+    episodeId?: string;
+    traceId?: string;
   } = {}
 ): Promise<string>
 ```
@@ -94,6 +100,10 @@ Stores content in the system and returns the ID of the created chunk:
 - `metadata`: Additional metadata to associate with the content
 - `summarize`: Whether to generate summaries for the content (default: `true`)
 - `preferredTier`: The preferred storage tier (default: `StorageTier.LOCAL`)
+- `extractProfile`: Whether to extract durable profile memory from this episode
+- `userId`: The user profile owner when extracting profile memory
+- `episodeId`: The source episode ID to link profile fields to (defaults to the chunk ID)
+- `traceId`: The trace ID to link extracted profile fields to
 
 ##### retrieveContent
 
@@ -105,8 +115,11 @@ async retrieveContent(
     bucketDomain?: string;
     maxResults?: number;
     minScore?: number;
+    includeProfiles?: boolean;
+    userId?: string;
+    maxProfileSnippets?: number;
   } = {}
-): Promise<Array<{ chunk: Chunk, score: number }>>
+): Promise<Array<{ chunk: Chunk, score: number, profileSnippets?: UserProfileSnippet[] }>>
 ```
 
 Retrieves content from the system based on a query:
@@ -116,6 +129,65 @@ Retrieves content from the system based on a query:
 - `bucketDomain`: The domain of the bucket to search in (optional)
 - `maxResults`: The maximum number of results to return (default: `10`)
 - `minScore`: The minimum similarity score for results (default: `0.7`)
+- `includeProfiles`: Whether to attach relevant profile snippets to each result
+- `userId`: Limits profile snippets to one user's profile memories
+- `maxProfileSnippets`: Maximum number of profile snippets to include
+
+##### assembleAgentContext
+
+```typescript
+async assembleAgentContext(
+  query: string,
+  options: {
+    bucketName?: string;
+    bucketDomain?: string;
+    maxResults?: number;
+    minScore?: number;
+    userId?: string;
+    maxProfileSnippets?: number;
+  } = {}
+): Promise<{
+  contentResults: Array<{ chunk: Chunk, score: number }>;
+  profileSnippets: UserProfileSnippet[];
+}>
+```
+
+Assembles normal retrieval results plus separately stored profile snippets for agent prompt construction. Profile snippets are linked to their source episode IDs and trace IDs.
+
+##### getUserProfileMemories
+
+```typescript
+getUserProfileMemories(userId?: string): UserProfileMemory[]
+```
+
+Inspects stored profile memories after applying current privacy controls.
+
+##### deleteUserProfileMemory
+
+```typescript
+async deleteUserProfileMemory(options: {
+  profileId?: string;
+  userId?: string;
+} = {}): Promise<number>
+```
+
+Deletes one profile memory by ID or all profile memories for a user.
+
+##### setProfilePrivacy
+
+```typescript
+setProfilePrivacy(settings: Partial<UserProfilePrivacySettings>): UserProfilePrivacySettings
+```
+
+Updates profile memory privacy controls. Set `enabled: false` to disable future profile extraction/storage and exclude profile snippets from retrieval. Use `disabledFields` or `disabledFieldKeys` to suppress specific profile categories or field keys.
+
+##### getProfilePrivacy
+
+```typescript
+getProfilePrivacy(): UserProfilePrivacySettings
+```
+
+Returns the current profile memory privacy controls.
 
 ##### summarize
 
@@ -172,6 +244,29 @@ Adds a memory alert handler:
 - `handler`: The handler function to add
 
 ## Core Components
+
+### MemoryExtractor
+
+Extracts durable profile-memory signals from source episodes. The default extractor uses conservative transparent heuristics for preferences, interests, emotional state, and behavioral patterns.
+
+```typescript
+const extractor = new MemoryExtractor({
+  profilePrivacy: {
+    enabled: true,
+    disabledFields: ['emotionalState'],
+    disabledFieldKeys: ['preferences.favorite'],
+  },
+});
+
+const profile = extractor.extractProfileMemory({
+  content: 'I prefer concise summaries. I am interested in robotics.',
+  userId: 'user-123',
+  episodeId: 'episode-456',
+  traceId: 'trace-789',
+});
+```
+
+Extracted profile memories are stored separately from normal chunks and preserve source episode/trace links for auditability and deletion workflows.
 
 ### MemoryManager
 
