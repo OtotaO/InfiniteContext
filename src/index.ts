@@ -174,6 +174,7 @@ export class InfiniteContext {
           enableLearning: categorizerOptions.enableLearning !== false,
         }
       );
+      await this.promptCategorizer.initialize();
       
       console.log('Prompt categorizer initialized');
     }
