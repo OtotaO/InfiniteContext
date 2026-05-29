@@ -4,6 +4,12 @@ import { v4 as uuidv4 } from 'uuid';
 import { ChunkLocation, StorageQuota, StorageTier } from '../core/types.js';
 import { StorageProvider } from './StorageProvider.js';
 
+export interface LocalStorageProviderOptions {
+  id?: string;
+  name?: string;
+  maxSizeBytes?: number;
+}
+
 /**
  * Storage provider that uses the local filesystem.
  * 
@@ -21,20 +27,14 @@ export class LocalStorageProvider implements StorageProvider {
   /**
    * Create a new LocalStorageProvider
    * 
-   * @param id - The unique ID of this provider
    * @param basePath - The base path to store data in
-   * @param maxSizeBytes - The maximum size in bytes this provider can store
+   * @param options - Optional provider settings
    */
-  constructor(
-    id: string = 'local',
-    name: string = 'Local Filesystem',
-    basePath: string,
-    maxSizeBytes: number = 5 * 1024 * 1024 * 1024 // 5 GB
-  ) {
-    this.id = id;
-    this.name = name;
+  constructor(basePath: string, options: LocalStorageProviderOptions = {}) {
+    this.id = options.id ?? 'local';
+    this.name = options.name ?? 'Local Filesystem';
     this.basePath = basePath;
-    this.maxSizeBytes = maxSizeBytes;
+    this.maxSizeBytes = options.maxSizeBytes ?? 5 * 1024 * 1024 * 1024; // 5 GB
   }
 
   /**
