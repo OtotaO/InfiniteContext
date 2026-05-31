@@ -1,34 +1,82 @@
 import { promises as fs } from 'fs';
 import { dirname } from 'path';
-import { Vector, SearchResult, Chunk } from './types.js';
+import { Vector, SearchResult, Chunk, MemoryFeedback, MemoryMetadata, DeletionStatus } from './types.js';
+import { indexManager, IndexType } from '../utils/IndexManager.js';
 
 /**
  * Simple in-memory vector store implementation with basic search functionality.
- * This implementation uses brute-force search with cosine similarity, which is
- * not as efficient as HNSW but doesn't require native dependencies.
+ *
+ * The first functional release uses exact flat indexing. Save operations persist
+ * both the chunk payload and a real flat index artifact used by index-management
+ * utilities. Approximate backends such as HNSW are intentionally unsupported
+ * until they are wired into every rebuild, merge, split, save, and load path.
  */
 export class VectorStore {
+  private static readonly DEFAULT_MEMORY_WEIGHT = 1;
+  private static readonly DEFAULT_DECAY_RATE = 0.01;
+  private static readonly MIN_MEMORY_WEIGHT = 0.05;
+  private static readonly STALE_MEMORY_MULTIPLIER = 0.25;
+  private static readonly DAY_MS = 24 * 60 * 60 * 1000;
+
   private dimension: number;
+  /**
+   * When no explicit dimension is supplied, the store adopts the dimension of
+   * the first chunk it sees. This lets MemoryManager-created buckets work with
+   * any embedding function size while still validating consistency thereafter.
+   */
+  private autoDimension: boolean;
   private metric: 'cosine' | 'euclidean' | 'dot';
   private chunks: Chunk[] = [];
   private dirty = false;
   private path?: string;
 
+  private getIndexPath(basePath: string): string {
+    return `${basePath}.index.json`;
+  }
+
+  private async persistIndexArtifact(basePath: string): Promise<void> {
+    const indexBuilt = await indexManager.rebuildIndex(
+      this.chunks,
+      {
+        type: IndexType.FLAT,
+        dimension: this.dimension,
+        metric: this.metric,
+      },
+      this.getIndexPath(basePath)
+    );
+
+    if (!indexBuilt) {
+      throw new Error('Failed to persist vector store index artifact');
+    }
+  }
+
   /**
    * Create a new VectorStore instance
-   * 
+   *
    * @param dimension - The dimensionality of vectors to be stored
    * @param metric - The distance metric to use ('cosine', 'euclidean', or 'dot')
    * @param path - Optional path for persistence
    */
   constructor(
-    dimension: number = 1536,
+    dimension?: number,
     metric: 'cosine' | 'euclidean' | 'dot' = 'cosine',
     path?: string
   ) {
-    this.dimension = dimension;
+    this.autoDimension = dimension === undefined;
+    this.dimension = dimension ?? 1536;
     this.metric = metric;
     this.path = path;
+  }
+
+  /**
+   * Adopt the dimension from the first observed vector when running in
+   * auto-dimension mode (no explicit dimension was configured).
+   */
+  private adoptDimensionIfNeeded(vector: Vector): void {
+    if (this.autoDimension && this.chunks.length === 0 && vector.length > 0) {
+      this.dimension = vector.length;
+      this.autoDimension = false;
+    }
   }
 
   /**
@@ -36,7 +84,7 @@ export class VectorStore {
    */
   private normalizeVector(vector: Vector): Vector {
     if (this.metric !== 'cosine') return vector;
-    
+
     const norm = Math.sqrt(vector.reduce((sum, val) => sum + val * val, 0));
     if (norm === 0) return vector;
     return vector.map(val => val / norm);
@@ -45,7 +93,15 @@ export class VectorStore {
   /**
    * Calculate the distance between two vectors based on the metric
    */
-  private calculateDistance(a: Vector, b: Vector): number {
+  private validateDimension(vector: Vector, label: string): void {
+    if (vector.length !== this.dimension) {
+      throw new Error(
+        `${label} dimension mismatch: expected ${this.dimension}, received ${vector.length}`
+      );
+    }
+  }
+
+  public calculateSimilarity(a: Vector, b: Vector): number {
     if (a.length !== b.length) {
       throw new Error('Vectors must have the same dimension');
     }
@@ -72,25 +128,112 @@ export class VectorStore {
   }
 
   /**
+   * Create a defensive copy of a chunk so callers cannot mutate the store's
+   * internal state through returned chunk references.
+   */
+  private cloneChunk(chunk: Chunk): Chunk {
+    return {
+      ...chunk,
+      embedding: [...chunk.embedding],
+      metadata: {
+        ...chunk.metadata,
+        tags: [...chunk.metadata.tags],
+      },
+      summaries: chunk.summaries.map(summary => ({
+        ...summary,
+        concepts: [...summary.concepts],
+      })),
+      memory: chunk.memory ? { ...chunk.memory } : undefined,
+    };
+  }
+
+  /**
+   * Ensure older persisted chunks have lifecycle metadata.
+   */
+  private ensureMemoryMetadata(chunk: Chunk, now: Date = new Date()): MemoryMetadata {
+    if (!chunk.memory) {
+      chunk.memory = {
+        weight: VectorStore.DEFAULT_MEMORY_WEIGHT,
+        lastAccessedAt: chunk.metadata.timestamp || now.toISOString(),
+        accessCount: 0,
+        decayRate: VectorStore.DEFAULT_DECAY_RATE,
+      };
+    }
+
+    chunk.memory.weight = typeof chunk.memory.weight === 'number'
+      ? chunk.memory.weight
+      : VectorStore.DEFAULT_MEMORY_WEIGHT;
+    chunk.memory.lastAccessedAt = chunk.memory.lastAccessedAt || chunk.metadata.timestamp || now.toISOString();
+    chunk.memory.accessCount = typeof chunk.memory.accessCount === 'number'
+      ? chunk.memory.accessCount
+      : 0;
+    chunk.memory.decayRate = typeof chunk.memory.decayRate === 'number'
+      ? chunk.memory.decayRate
+      : VectorStore.DEFAULT_DECAY_RATE;
+
+    return chunk.memory;
+  }
+
+  /**
+   * Calculate an effective retrieval weight with exponential time decay.
+   */
+  private getEffectiveMemoryWeight(chunk: Chunk, now: Date = new Date()): number {
+    const memory = this.ensureMemoryMetadata(chunk, now);
+    const lastAccessedAt = Date.parse(memory.lastAccessedAt);
+    const elapsedDays = Number.isNaN(lastAccessedAt)
+      ? 0
+      : Math.max(0, (now.getTime() - lastAccessedAt) / VectorStore.DAY_MS);
+    const decayedWeight = memory.weight * Math.exp(-memory.decayRate * elapsedDays);
+    const lifecycleMultiplier = memory.invalidatedAt ? VectorStore.STALE_MEMORY_MULTIPLIER : 1;
+
+    return Math.max(VectorStore.MIN_MEMORY_WEIGHT, decayedWeight * lifecycleMultiplier);
+  }
+
+  /**
+   * Blend vector similarity with decayed memory confidence/lifecycle weight.
+   */
+  private calculateRetrievalScore(queryVector: Vector, chunk: Chunk, now: Date = new Date()): number {
+    const semanticScore = this.calculateSimilarity(queryVector, chunk.embedding);
+    return semanticScore * this.getEffectiveMemoryWeight(chunk, now);
+  }
+
+  /**
+   * Mark a chunk as accessed after retrieval.
+   */
+  private recordChunkAccess(chunk: Chunk, now: Date = new Date()): void {
+    const memory = this.ensureMemoryMetadata(chunk, now);
+    memory.lastAccessedAt = now.toISOString();
+    memory.accessCount += 1;
+    this.dirty = true;
+  }
+
+  /**
    * Add a chunk to the vector store
-   * 
+   *
    * @param chunk - The chunk to add
    * @returns The internal ID assigned to the chunk
    */
   public addChunk(chunk: Chunk): number {
+    this.adoptDimensionIfNeeded(chunk.embedding);
+    this.validateDimension(chunk.embedding, 'Chunk embedding');
+
+    const storedChunk = this.cloneChunk(chunk);
+
     // Make sure the embedding is normalized if using cosine similarity
     if (this.metric === 'cosine') {
-      chunk.embedding = this.normalizeVector([...chunk.embedding]);
+      storedChunk.embedding = this.normalizeVector(storedChunk.embedding);
     }
-    
-    this.chunks.push(chunk);
+
+    this.ensureMemoryMetadata(storedChunk);
+
+    this.chunks.push(storedChunk);
     this.dirty = true;
     return this.chunks.length - 1;
   }
 
   /**
    * Add multiple chunks to the vector store
-   * 
+   *
    * @param chunks - The chunks to add
    * @returns The internal IDs assigned to the chunks
    */
@@ -99,8 +242,27 @@ export class VectorStore {
   }
 
   /**
+   * Get every chunk in insertion order.
+   *
+   * Returned chunks are defensive copies, so mutating them will not affect the
+   * chunks held by this vector store. Deleted chunks are excluded unless
+   * `includeDeleted` is set.
+   *
+   * @param includeDeleted - Whether to include chunks marked as deleted
+   * @returns A copy of all stored chunks
+   */
+  public getAllChunks(includeDeleted: boolean = false): Chunk[] {
+    return this.chunks
+      .filter(chunk => includeDeleted || chunk.metadata.deletionStatus !== DeletionStatus.DELETED)
+      .map(chunk => {
+        this.ensureMemoryMetadata(chunk);
+        return this.cloneChunk(chunk);
+      });
+  }
+
+  /**
    * Search for chunks similar to the query vector
-   * 
+   *
    * @param queryVector - The query vector
    * @param k - The number of results to return
    * @returns The search results, sorted by similarity
@@ -110,25 +272,110 @@ export class VectorStore {
       return [];
     }
 
-    // Calculate distances
-    const results = this.chunks.map((chunk, id) => ({
-      chunk,
-      score: this.calculateDistance(queryVector, chunk.embedding),
-      id
-    }));
+    this.validateDimension(queryVector, 'Query vector');
+
+    const now = new Date();
+
+    // Exclude deleted memories, then score by semantic similarity blended with
+    // decayed memory weight.
+    const results = this.chunks
+      .filter(chunk => chunk.metadata.deletionStatus !== DeletionStatus.DELETED)
+      .map(chunk => ({
+        chunk,
+        score: this.calculateRetrievalScore(queryVector, chunk, now),
+      }));
 
     // Sort by score (descending)
     results.sort((a, b) => b.score - a.score);
 
-    // Return top k results
-    return results.slice(0, k).map(({ chunk, score }) => ({ chunk, score }));
+    // Return top k results and record access on surfaced memories.
+    return results.slice(0, k).map(({ chunk, score }) => {
+      this.recordChunkAccess(chunk, now);
+      return { chunk, score };
+    });
+  }
+
+  /**
+   * Find a chunk by its public ID.
+   */
+  public getChunk(chunkId: string): Chunk | undefined {
+    const chunk = this.chunks.find(candidate => candidate.id === chunkId);
+    if (chunk) {
+      this.ensureMemoryMetadata(chunk);
+    }
+    return chunk;
+  }
+
+  /**
+   * Record explicit user feedback for a memory without deleting rebutted content.
+   */
+  public recordMemoryFeedback(chunkId: string, feedback: MemoryFeedback): Chunk | undefined {
+    const chunk = this.getChunk(chunkId);
+    if (!chunk) {
+      return undefined;
+    }
+
+    const now = new Date();
+    const memory = this.ensureMemoryMetadata(chunk, now);
+
+    switch (feedback) {
+      case 'approve':
+        memory.weight = Math.min(2, memory.weight + 0.15);
+        delete memory.invalidatedAt;
+        break;
+      case 'neutral':
+        memory.weight = Math.max(VectorStore.MIN_MEMORY_WEIGHT, memory.weight * 0.98);
+        break;
+      case 'rebut':
+        memory.weight = Math.max(VectorStore.MIN_MEMORY_WEIGHT, memory.weight * 0.35);
+        memory.invalidatedAt = now.toISOString();
+        break;
+      default:
+        throw new Error(`Unsupported feedback: ${feedback}`);
+    }
+
+    memory.lastAccessedAt = now.toISOString();
+    this.dirty = true;
+    return chunk;
+  }
+
+  /**
+   * Get a copy of all chunks in insertion order.
+   */
+  public getChunks(): Chunk[] {
+    return [...this.chunks];
+  }
+
+
+  /**
+   * Search and include how many stored vectors were evaluated.
+   */
+  public searchWithStats(queryVector: Vector, k: number = 10): { results: SearchResult[]; candidatesScanned: number } {
+    return {
+      results: this.search(queryVector, k),
+      candidatesScanned: this.chunks.length
+    };
+  }
+
+  /**
+   * Replace a chunk by ID.
+   */
+  public updateChunk(chunk: Chunk): boolean {
+    const index = this.chunks.findIndex(existing => existing.id === chunk.id);
+    if (index === -1) {
+      return false;
+    }
+
+    this.chunks[index] = chunk;
+    this.dirty = true;
+    return true;
   }
 
   /**
    * Get the number of chunks in the store
    */
-  public size(): number {
-    return this.chunks.length;
+  public size(includeDeleted: boolean = true): number {
+    return this.getAllChunks(includeDeleted).length;
   }
 
   /**
@@ -146,9 +393,11 @@ export class VectorStore {
     // Save chunks
     await fs.writeFile(
       `${savePath}.json`,
-      JSON.stringify(this.chunks),
+      JSON.stringify(this.chunks, null, 2),
       'utf-8'
     );
+
+    await this.persistIndexArtifact(savePath);
 
     this.dirty = false;
   }
@@ -168,7 +417,30 @@ export class VectorStore {
         `${loadPath}.json`,
         'utf-8'
       );
-      this.chunks = JSON.parse(chunksData);
+      this.chunks = JSON.parse(chunksData) as Chunk[];
+
+      // Adopt dimension from persisted data when running in auto-dimension mode.
+      if (this.autoDimension && this.chunks.length > 0 && this.chunks[0].embedding.length > 0) {
+        this.dimension = this.chunks[0].embedding.length;
+        this.autoDimension = false;
+      }
+
+      for (const chunk of this.chunks) {
+        if (chunk.embedding.length !== this.dimension) {
+          throw new Error(`Loaded chunk ${chunk.id} embedding dimension ${chunk.embedding.length} does not match store dimension ${this.dimension}`);
+        }
+        this.ensureMemoryMetadata(chunk);
+      }
+
+      try {
+        const artifact = await indexManager.loadFlatIndex(this.getIndexPath(loadPath));
+        if (artifact.params.dimension !== this.dimension || artifact.params.metric !== this.metric || artifact.size !== this.chunks.length) {
+          await this.persistIndexArtifact(loadPath);
+        }
+      } catch {
+        await this.persistIndexArtifact(loadPath);
+      }
+
       this.dirty = false;
     } catch (error) {
       throw new Error(`Failed to load vector store: ${error}`);

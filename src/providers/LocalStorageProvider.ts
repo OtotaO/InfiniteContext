@@ -52,6 +52,20 @@ export class LocalStorageProvider implements StorageProvider {
   }
 
   /**
+   * Get the base path used by this local provider.
+   */
+  public getBasePath(): string {
+    return this.basePath;
+  }
+
+  /**
+   * Get the maximum number of bytes this provider can store.
+   */
+  public getMaxSizeBytes(): number {
+    return this.maxSizeBytes;
+  }
+
+  /**
    * Get the storage tier of this provider
    */
   public getTier(): StorageTier {

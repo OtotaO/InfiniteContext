@@ -37,6 +37,8 @@ export class PromptCategorizer {
   private cache: CategoryCache;
   private strategies: CategorizationStrategy[] = [];
   private adaptiveStrategy?: AdaptiveStrategy;
+  private initializationPromise?: Promise<void>;
+  private initialized = false;
   private defaultThresholds: {
     keywordMatchThreshold: number;
     vectorSimilarityThreshold: number;
@@ -71,15 +73,36 @@ export class PromptCategorizer {
       this.adaptiveStrategy = new AdaptiveStrategy();
       this.strategies.push(this.adaptiveStrategy);
     }
-    
-    // Load initial categories from existing buckets
-    this.initializeFromBuckets();
+  }
+
+  /**
+   * Initialize categories from existing buckets.
+   */
+  public async initialize(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    if (!this.initializationPromise) {
+      this.initializationPromise = this.initializeFromBuckets()
+        .then(() => {
+          this.initialized = true;
+        })
+        .catch((error) => {
+          this.initializationPromise = undefined;
+          throw error;
+        });
+    }
+
+    await this.initializationPromise;
   }
   
   /**
    * Initialize categories from existing buckets
    */
   private async initializeFromBuckets(): Promise<void> {
+    this.categories = [];
+
     const buckets = this.memoryManager.getBuckets();
     
     for (const bucket of buckets.values()) {
@@ -137,6 +160,8 @@ export class PromptCategorizer {
     prompt: string, 
     output: string
   ): Promise<CategorizationResult> {
+    await this.ensureInitialized();
+
     // Check cache first
     const promptHash = hashString(prompt);
     const cachedResult = this.cache.get(promptHash);
@@ -213,6 +238,22 @@ export class PromptCategorizer {
     };
   }
   
+  /**
+   * Ensure initialization has completed before categorizing.
+   */
+  private async ensureInitialized(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    if (this.initializationPromise) {
+      await this.initializationPromise;
+      return;
+    }
+
+    throw new Error('Prompt categorizer is not initialized. Call initialize() before categorize().');
+  }
+
   /**
    * Record feedback about a categorization
    * 
