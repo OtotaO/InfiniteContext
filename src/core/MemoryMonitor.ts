@@ -104,6 +104,11 @@ export class MemoryMonitor {
     this.monitoringInterval = setInterval(() => {
       this.checkMemoryUsage();
     }, this.config.monitoringIntervalMs);
+
+    // Don't let the monitoring timer keep the process (or a test runner) alive.
+    if (typeof this.monitoringInterval.unref === 'function') {
+      this.monitoringInterval.unref();
+    }
   }
 
   /**

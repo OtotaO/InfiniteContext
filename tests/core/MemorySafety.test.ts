@@ -25,6 +25,8 @@ describe('long-term memory safety controls', () => {
 
     const listed = manager.listMemories({ domain: 'work' });
     expect(listed.chunks.map(chunk => chunk.id)).toEqual([active.id]);
+
+    await manager.shutdown();
   });
 
   it('redacts, exports, and deletes memories by query filters', async () => {
@@ -57,5 +59,7 @@ describe('long-term memory safety controls', () => {
     expect(manager.deleteMemories({ sensitivity: SensitivityLevel.RESTRICTED }, 'retention')).toEqual({ matched: 2, changed: 2 });
     expect(manager.listMemories({ userId: 'u1' }).chunks).toHaveLength(0);
     expect(manager.listMemories({ userId: 'u1', includeDeleted: true }).chunks[0].metadata.deletionStatus).toBe(DeletionStatus.DELETED);
+
+    await manager.shutdown();
   });
 });
