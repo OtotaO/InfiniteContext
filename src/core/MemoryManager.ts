@@ -6,6 +6,7 @@ import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
 import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './HierarchicalRetriever.js';
+import { buildNegationAwareQueryVector } from './NegationAwareRetrieval.js';
 import path from 'path';
 import os from 'os';
 import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, sanitizeChunkForExport } from '../utils/MemorySafety.js';
@@ -65,6 +66,7 @@ export class MemoryManager {
   private memoryMonitor: MemoryMonitor;
   private alertHandlers: Array<(alert: MemoryAlert) => void> = [];
   private isInitializing = false;
+  private isShutdown = false;
   private manifestSaveQueue: Promise<void> = Promise.resolve();
 
   /**
@@ -456,14 +458,21 @@ export class MemoryManager {
    */
   public async searchMemory(
     query: string | Vector,
-    options: (HierarchicalRetrieverOptions & { mode?: 'flat' | 'hierarchical'; k?: number }) = {}
+    options: (HierarchicalRetrieverOptions & { mode?: 'flat' | 'hierarchical'; k?: number; negationAware?: boolean }) = {}
   ): Promise<HierarchicalSearchResponse> {
     if (!this.embeddingFunction && typeof query === 'string') {
       throw new Error('No embedding function provided');
     }
 
+    // For text queries, route through negation-aware embedding so that
+    // "notes without cilantro" ranks away from cilantro rather than toward it.
+    // Falls back to a plain embedding when no negation is present, and can be
+    // disabled with `negationAware: false`. Pre-embedded vector queries are
+    // used as-is (we can't recover the negation structure from a vector).
     const queryVector = typeof query === 'string'
-      ? await this.embeddingFunction!(query)
+      ? (options.negationAware === false
+          ? await this.embeddingFunction!(query)
+          : await buildNegationAwareQueryVector(query, this.embeddingFunction!))
       : query;
     const chunks = this.getAllChunks();
     const retriever = new HierarchicalRetriever(chunks);
@@ -861,6 +870,30 @@ export class MemoryManager {
   }
 
   /**
+   * Gracefully shut down the memory manager.
+   *
+   * Stops the monitoring timer and flushes any in-flight background manifest
+   * writes, then blocks further background persistence. Callers (and tests)
+   * should await this before discarding the instance or its base directory to
+   * avoid writes racing against teardown.
+   */
+  public async shutdown(): Promise<void> {
+    if (this.isShutdown) {
+      await this.manifestSaveQueue.catch(() => {});
+      return;
+    }
+
+    this.memoryMonitor.stopMonitoring();
+
+    // Block further background persistence first, so nothing new is appended to
+    // the queue while we drain it.
+    this.isShutdown = true;
+
+    // Drain any queued background writes that were scheduled before shutdown.
+    await this.manifestSaveQueue.catch(() => {});
+  }
+
+  /**
    * Handle a memory alert
    *
    * @param alert - The alert to handle
@@ -919,7 +952,7 @@ export class MemoryManager {
   }
 
   private persistManifestInBackground(): void {
-    if (this.isInitializing) {
+    if (this.isInitializing || this.isShutdown) {
       return;
     }
 
