@@ -6,6 +6,7 @@ import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
 import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './HierarchicalRetriever.js';
+import { buildNegationAwareQueryVector } from './NegationAwareRetrieval.js';
 import path from 'path';
 import os from 'os';
 import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, sanitizeChunkForExport } from '../utils/MemorySafety.js';
@@ -457,14 +458,21 @@ export class MemoryManager {
    */
   public async searchMemory(
     query: string | Vector,
-    options: (HierarchicalRetrieverOptions & { mode?: 'flat' | 'hierarchical'; k?: number }) = {}
+    options: (HierarchicalRetrieverOptions & { mode?: 'flat' | 'hierarchical'; k?: number; negationAware?: boolean }) = {}
   ): Promise<HierarchicalSearchResponse> {
     if (!this.embeddingFunction && typeof query === 'string') {
       throw new Error('No embedding function provided');
     }
 
+    // For text queries, route through negation-aware embedding so that
+    // "notes without cilantro" ranks away from cilantro rather than toward it.
+    // Falls back to a plain embedding when no negation is present, and can be
+    // disabled with `negationAware: false`. Pre-embedded vector queries are
+    // used as-is (we can't recover the negation structure from a vector).
     const queryVector = typeof query === 'string'
-      ? await this.embeddingFunction!(query)
+      ? (options.negationAware === false
+          ? await this.embeddingFunction!(query)
+          : await buildNegationAwareQueryVector(query, this.embeddingFunction!))
       : query;
     const chunks = this.getAllChunks();
     const retriever = new HierarchicalRetriever(chunks);

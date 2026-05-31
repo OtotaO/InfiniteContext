@@ -68,12 +68,23 @@ Two concrete weaknesses in pure-embedding memory that the paper speaks to:
 
 ## What we could build (smallest → largest)
 
-### A. Negation-aware retrieval (small, high value, low risk) — recommended first
-Detect negation scope in a query/memory and apply an orthogonal-complement
-(or swap) transform so "not X" ranks *away* from X instead of next to it.
-Self-contained: a transform over existing vectors plus a query-side parser hook.
-No new storage, no grammar engine. Directly extracts the paper's most practical
-idea. Measurable against a small negation test set.
+### A. Negation-aware retrieval — **implemented**
+Detect negation scope in a query and apply an orthogonal-complement transform so
+"not X" ranks *away* from X instead of next to it. Self-contained: a transform
+over existing vectors plus a query-side parser hook. No new storage, no grammar
+engine. Directly extracts the paper's most practical idea.
+
+Shipped in `src/core/NegationAwareRetrieval.ts`:
+- `parseNegation()` — lightweight, clause-local negation-scope parser (cues:
+  `not`, `no`, `without`, `never`, `n't` contractions, …).
+- `orthogonalNegation()` — Widdows orthogonal negation: Gram-Schmidt the negated
+  directions, then project the query onto their orthogonal complement.
+- `buildNegationAwareQueryVector()` — orchestration; returns exactly
+  `embed(query)` when no negation is present, so every text query can route
+  through it safely.
+
+Wired into `MemoryManager.searchMemory()` for text queries (opt out with
+`negationAware: false`). Covered by `tests/core/NegationAwareRetrieval.test.ts`.
 
 ### B. Typed relational memory layer (medium)
 Store `(subject, relation, object)` with the relation as a tensor/role, enabling
@@ -97,9 +108,10 @@ production memory system. Documented here for completeness; not proposed now.
   places embeddings provably misbehave — **negation** chief among them — not
   re-deriving sentence vectors we already get from a model.
 
-## Recommendation
+## Status & next
 
-Pursue **A (negation-aware retrieval)** as a concrete, testable first step, and
-use the `FVect`/`FRel` framing from the paper to guide the eventual unification
-of `ProfileMemory` and `UserProfileMemory` (option B territory). Treat C as
-inspiration, not a deliverable.
+**A is implemented** (see above). Natural follow-ups, in order:
+- Use the `FVect`/`FRel` framing to guide the eventual unification of
+  `ProfileMemory` and `UserProfileMemory` (option B territory).
+- Optionally extend negation handling to *stored* memories, not just queries.
+- Treat C (a full DisCoCat sentence encoder) as inspiration, not a deliverable.
