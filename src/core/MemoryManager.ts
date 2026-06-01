@@ -77,6 +77,10 @@ export class MemoryManager {
   private isInitializing = false;
   private isShutdown = false;
   private manifestSaveQueue: Promise<void> = Promise.resolve();
+  // Cached hierarchical index; rebuilt lazily only when the chunk set changes,
+  // so repeated queries don't pay an O(n) index rebuild each time.
+  private cachedRetriever?: HierarchicalRetriever;
+  private retrieverDirty = true;
 
   /**
    * Create a new MemoryManager
@@ -205,7 +209,7 @@ export class MemoryManager {
       id: uuidv4(),
       ...config
     };
-    const bucket = new Bucket(fullConfig, undefined, () => this.persistManifestInBackground());
+    const bucket = new Bucket(fullConfig, undefined, () => this.onBucketChange());
     this.rootBuckets.set(bucket.getId(), bucket);
     this.persistManifestInBackground();
 
@@ -470,6 +474,27 @@ export class MemoryManager {
   }
 
   /**
+   * Callback handed to every bucket: any chunk mutation both schedules a
+   * manifest write and invalidates the cached retriever.
+   */
+  private onBucketChange(): void {
+    this.retrieverDirty = true;
+    this.persistManifestInBackground();
+  }
+
+  /**
+   * Return the cached hierarchical retriever, rebuilding it only when the chunk
+   * set has changed since the last build.
+   */
+  private getRetriever(): HierarchicalRetriever {
+    if (this.retrieverDirty || !this.cachedRetriever) {
+      this.cachedRetriever = new HierarchicalRetriever(this.getAllChunks());
+      this.retrieverDirty = false;
+    }
+    return this.cachedRetriever;
+  }
+
+  /**
    * Search indexed memory with either legacy flat search or hierarchical routed retrieval.
    */
   public async searchMemory(
@@ -490,8 +515,7 @@ export class MemoryManager {
           ? await this.embeddingFunction!(query)
           : await buildNegationAwareQueryVector(query, this.embeddingFunction!))
       : query;
-    const chunks = this.getAllChunks();
-    const retriever = new HierarchicalRetriever(chunks);
+    const retriever = this.getRetriever();
 
     if (options.mode === 'flat') {
       return retriever.flatSearch(queryVector, options.k ?? options.finalK ?? 10);
@@ -1185,7 +1209,7 @@ export class MemoryManager {
   }
 
   private deserializeBucket(manifestBucket: ManifestBucket, allBuckets: Map<string, Bucket>): Bucket {
-    const bucket = new Bucket(manifestBucket.config, undefined, () => this.persistManifestInBackground());
+    const bucket = new Bucket(manifestBucket.config, undefined, () => this.onBucketChange());
     allBuckets.set(bucket.getId(), bucket);
 
     for (const manifestSubBucket of manifestBucket.subBuckets || []) {

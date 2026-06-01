@@ -213,14 +213,31 @@ describe('VectorStore', () => {
       expect(secondShard.entries).toHaveLength(1);
     });
 
-    it('should reject approximate index operations instead of returning fake success', async () => {
-      const tempDir = await mkdtemp(join(tmpdir(), 'index-manager-unsupported-'));
-      const unsupportedParams = { type: IndexType.HNSW, dimension, metric: 'cosine' as const };
+    it('should build and query an approximate HNSW index', async () => {
+      const tempDir = await mkdtemp(join(tmpdir(), 'index-manager-hnsw-'));
+      const params = { type: IndexType.HNSW, dimension, metric: 'cosine' as const, M: 16, efConstruction: 100 };
       const outputPath = join(tempDir, 'hnsw-index.json');
 
-      await expect(indexManager.rebuildIndex([createTestChunk(dimension)], unsupportedParams, outputPath)).resolves.toBe(false);
+      // Distinct unit vectors so nearest-neighbour results are unambiguous.
+      const target = createTestChunk(dimension, [1, 0, 0, 0, 0]);
+      const other = createTestChunk(dimension, [0, 1, 0, 0, 0]);
+      const third = createTestChunk(dimension, [0, 0, 1, 0, 0]);
 
-      await expect(readFile(outputPath, 'utf-8')).rejects.toThrow();
+      await expect(indexManager.rebuildIndex([target, other, third], params, outputPath)).resolves.toBe(true);
+
+      // The sidecar and the hnswlib binary are both persisted.
+      const sidecar = JSON.parse(await readFile(outputPath, 'utf-8'));
+      expect(sidecar.backend).toBe(IndexType.HNSW);
+      await expect(stat(join(tempDir, sidecar.binary))).resolves.toBeDefined();
+
+      const hits = await indexManager.searchHnswIndex(outputPath, [1, 0, 0, 0, 0], 2);
+      expect(hits[0].chunk.id).toBe(target.id);
+      expect(hits[0].score).toBeGreaterThan(hits[1].score);
+    });
+
+    it('selects an approximate index only once the dataset is large', () => {
+      expect(indexManager.getOptimalIndexParams(100, dimension).type).toBe(IndexType.FLAT);
+      expect(indexManager.getOptimalIndexParams(50_000, dimension).type).toBe(IndexType.HNSW);
     });
   });
 
