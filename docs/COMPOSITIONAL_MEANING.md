@@ -111,7 +111,8 @@ production memory system. Documented here for completeness; not proposed now.
 ## Status & next
 
 **A is implemented** (see above). Natural follow-ups, in order:
-- Use the `FVect`/`FRel` framing to guide the eventual unification of
-  `ProfileMemory` and `UserProfileMemory` (option B territory).
+- The `ProfileMemory` / `UserProfileMemory` relationship is now resolved — see
+  [ADR 0001](./adr/0001-profile-memory-governance.md): two shapes, one
+  governance contract.
 - Optionally extend negation handling to *stored* memories, not just queries.
 - Treat C (a full DisCoCat sentence encoder) as inspiration, not a deliverable.

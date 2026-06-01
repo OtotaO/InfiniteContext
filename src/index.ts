@@ -431,9 +431,11 @@ export class InfiniteContext {
   }
 
   /**
-   * List chunk and profile memories by user, domain, bucket, tag, or sensitivity.
+   * List chunk, manual-profile, and extracted-profile memories by user, domain,
+   * bucket, tag, or sensitivity. Extracted user profiles are governed by the
+   * same surface and surface under `userProfiles`.
    */
-  public listMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+  public listMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[]; userProfiles: UserProfileMemory[] } {
     return this.memoryManager.listMemories(query);
   }
 
@@ -447,7 +449,7 @@ export class InfiniteContext {
   /**
    * Export memories with redaction/deletion markers respected.
    */
-  public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+  public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[]; userProfiles: UserProfileMemory[] } {
     return this.memoryManager.exportMemories(query);
   }
 

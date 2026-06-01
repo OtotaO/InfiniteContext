@@ -9,7 +9,7 @@ import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './Hierarchi
 import { buildNegationAwareQueryVector } from './NegationAwareRetrieval.js';
 import path from 'path';
 import os from 'os';
-import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, sanitizeChunkForExport } from '../utils/MemorySafety.js';
+import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, deleteUserProfileMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, redactUserProfile, sanitizeChunkForExport, sanitizeUserProfileForExport, userProfileMatchesQuery } from '../utils/MemorySafety.js';
 
 interface ManifestProvider {
   id: string;
@@ -308,6 +308,7 @@ export class MemoryManager {
   public getUserProfileMemories(userId?: string): UserProfileMemory[] {
     return Array.from(this.profileMemories.values())
       .filter(profile => !userId || profile.userId === userId)
+      .filter(profile => profile.deletionStatus !== DeletionStatus.DELETED)
       .map(profile => this.applyProfilePrivacy(profile));
   }
 
@@ -686,33 +687,46 @@ export class MemoryManager {
   /**
    * List chunk and profile memories matching safety filters.
    */
-  public listMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+  public listMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[]; userProfiles: UserProfileMemory[] } {
     const chunks = Array.from(this.rootBuckets.values())
       .flatMap(bucket => bucket.getAllChunks(true, true))
       .filter(chunk => memoryMatchesQuery(chunk, query));
     const profileMemories = Array.from(this.safetyProfileMemories.values())
       .filter(memory => memoryMatchesQuery(memory, query));
-    return { chunks, profileMemories };
+    const userProfiles = Array.from(this.profileMemories.values())
+      .filter(profile => userProfileMatchesQuery(profile, query))
+      .map(profile => this.applyProfilePrivacy(profile));
+    return { chunks, profileMemories, userProfiles };
   }
 
   /**
    * Redact matching memories while preserving tombstones for auditability.
    */
   public redactMemories(query: MemoryQuery, reason?: string): MemoryMutationResult {
-    return this.mutateMemories(query, chunk => redactChunk(chunk, reason), memory => redactProfileMemory(memory, reason));
+    return this.mutateMemories(
+      query,
+      chunk => redactChunk(chunk, reason),
+      memory => redactProfileMemory(memory, reason),
+      profile => redactUserProfile(profile, reason)
+    );
   }
 
   /**
    * Mark matching memories deleted while retaining deletion markers.
    */
   public deleteMemories(query: MemoryQuery, reason?: string): MemoryMutationResult {
-    return this.mutateMemories({ ...query, includeDeleted: true }, chunk => deleteChunkMarker(chunk, reason), memory => deleteProfileMemoryMarker(memory, reason));
+    return this.mutateMemories(
+      { ...query, includeDeleted: true },
+      chunk => deleteChunkMarker(chunk, reason),
+      memory => deleteProfileMemoryMarker(memory, reason),
+      profile => deleteUserProfileMarker(profile, reason)
+    );
   }
 
   /**
    * Export matching memories with redacted/deleted records sanitized.
    */
-  public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[] } {
+  public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[]; userProfiles: UserProfileMemory[] } {
     const memories = this.listMemories({ ...query, includeDeleted: query.includeDeleted ?? false });
     return {
       chunks: memories.chunks
@@ -724,10 +738,18 @@ export class MemoryManager {
         }
         return { ...memory };
       }),
+      userProfiles: memories.userProfiles
+        .map(profile => sanitizeUserProfileForExport(profile, !!query.includeDeleted))
+        .filter((profile): profile is UserProfileMemory => profile !== null),
     };
   }
 
-  private mutateMemories(query: MemoryQuery, chunkMutator: (chunk: Chunk) => Chunk, profileMutator: (memory: ProfileMemory) => ProfileMemory): MemoryMutationResult {
+  private mutateMemories(
+    query: MemoryQuery,
+    chunkMutator: (chunk: Chunk) => Chunk,
+    profileMutator: (memory: ProfileMemory) => ProfileMemory,
+    userProfileMutator: (profile: UserProfileMemory) => UserProfileMemory
+  ): MemoryMutationResult {
     let matched = 0;
     let changed = 0;
 
@@ -744,6 +766,13 @@ export class MemoryManager {
       if (!memoryMatchesQuery(memory, query)) continue;
       matched++;
       this.safetyProfileMemories.set(memory.id, profileMutator(memory));
+      changed++;
+    }
+
+    for (const profile of this.profileMemories.values()) {
+      if (!userProfileMatchesQuery(profile, query)) continue;
+      matched++;
+      this.profileMemories.set(profile.id, userProfileMutator(profile));
       changed++;
     }
 
