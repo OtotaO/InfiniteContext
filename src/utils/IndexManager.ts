@@ -1,10 +1,11 @@
 /**
  * Index management utilities for InfiniteContext
  *
- * The first functional release intentionally supports only a persisted flat
- * index. Approximate backends (HNSW/IVF) are not wired into runtime paths yet;
- * callers that request them receive an explicit failure instead of a fake
- * success value.
+ * Two backends are implemented: a persisted exact `flat` index, and an
+ * approximate `hnsw` index backed by `hnswlib-node` for sub-linear nearest
+ * neighbour search at scale. HNSW degrades gracefully to flat when the native
+ * module cannot be loaded, so callers never get a hard failure on platforms
+ * where the addon is unavailable. `ivf` remains reserved.
  */
 
 import fs from 'fs';
@@ -12,12 +13,15 @@ import path from 'path';
 import { Chunk } from '../core/types.js';
 import { errorHandler, VectorStoreError, ErrorCodes } from './ErrorHandler.js';
 
+/** Default dataset size at/above which an approximate index is preferred. */
+export const DEFAULT_HNSW_THRESHOLD = 10_000;
+
 /**
  * Index type
  */
 export enum IndexType {
   FLAT = 'flat',
-  /** Reserved for a future approximate backend; not supported in this release. */
+  /** Approximate nearest-neighbour backend (hnswlib-node). */
   HNSW = 'hnsw',
   /** Reserved for a future approximate backend; not supported in this release. */
   IVF = 'ivf',
@@ -78,6 +82,31 @@ export interface FlatIndexArtifact {
 }
 
 /**
+ * Sidecar metadata for an HNSW index. The graph itself is persisted by
+ * hnswlib-node to a `<outputPath>.hnsw` binary; this JSON maps integer labels
+ * back to chunks and records the parameters needed to reload the graph.
+ */
+export interface HnswIndexArtifact {
+  schemaVersion: 1;
+  backend: IndexType.HNSW;
+  params: Required<Pick<IndexParams, 'type' | 'dimension' | 'metric'>> & { M: number; efConstruction: number };
+  size: number;
+  /** Relative filename of the hnswlib binary, resolved against the sidecar dir. */
+  binary: string;
+  /** Chunks in label order (label i == chunks[i]). */
+  chunks: Chunk[];
+  createdAt: string;
+}
+
+/** A single nearest-neighbour search hit. */
+export interface IndexSearchHit {
+  chunk: Chunk;
+  score: number;
+}
+
+type HnswModule = typeof import('hnswlib-node');
+
+/**
  * Index manager for vector index optimization.
  *
  * Only flat/exact indexing is currently implemented. Approximate index types
@@ -111,8 +140,19 @@ export class IndexManager {
    * @returns The optimal supported index parameters
    */
   public getOptimalIndexParams(size: number, dimension: number, memoryBudget?: number): IndexParams {
-    void size;
     void memoryBudget;
+
+    // Prefer the approximate backend once the dataset is large enough that an
+    // exact scan becomes the dominant retrieval cost.
+    if (size >= DEFAULT_HNSW_THRESHOLD) {
+      return {
+        type: IndexType.HNSW,
+        dimension,
+        metric: 'cosine',
+        M: 16,
+        efConstruction: 200,
+      };
+    }
 
     return {
       type: IndexType.FLAT,
@@ -130,7 +170,13 @@ export class IndexManager {
    */
   public estimateMemoryUsage(params: IndexParams, size: number): number {
     this.assertSupportedParams(params);
-    return size * params.dimension * 4;
+    const vectorBytes = size * params.dimension * 4;
+    if (params.type === IndexType.HNSW) {
+      // Graph links: roughly size * M * 2 neighbours * 4 bytes.
+      const m = params.M ?? 16;
+      return vectorBytes + size * m * 2 * 4;
+    }
+    return vectorBytes;
   }
 
   /**
@@ -232,6 +278,10 @@ export class IndexManager {
     try {
       this.assertSupportedParams(params);
       this.assertChunkDimensions(chunks, params.dimension);
+
+      if (params.type === IndexType.HNSW) {
+        return await this.rebuildHnswIndex(chunks, params, outputPath);
+      }
 
       const artifact = this.createFlatArtifact(chunks, params);
       await this.writeArtifact(outputPath, artifact);
@@ -345,9 +395,104 @@ export class IndexManager {
     return this.readArtifact(indexPath);
   }
 
+  /**
+   * Build a persisted HNSW index from chunks. Falls back to a flat artifact at
+   * the same path if the native hnswlib module is unavailable, so callers always
+   * get a usable, queryable index.
+   */
+  private async rebuildHnswIndex(chunks: Chunk[], params: IndexParams, outputPath: string): Promise<boolean> {
+    const hnsw = await this.loadHnsw();
+    if (!hnsw) {
+      // Graceful degradation: produce a flat index the search path can still use.
+      const artifact = this.createFlatArtifact(chunks, { ...params, type: IndexType.FLAT });
+      await this.writeArtifact(outputPath, artifact);
+      return true;
+    }
+
+    const metric = params.metric || 'cosine';
+    const M = params.M ?? 16;
+    const efConstruction = params.efConstruction ?? 200;
+
+    const index = new hnsw.HierarchicalNSW(this.hnswSpace(metric), params.dimension);
+    index.initIndex(Math.max(1, chunks.length), M, efConstruction);
+    chunks.forEach((chunk, label) => index.addPoint(chunk.embedding, label));
+
+    const binaryPath = `${outputPath}.hnsw`;
+    await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+    index.writeIndexSync(binaryPath);
+
+    const sidecar: HnswIndexArtifact = {
+      schemaVersion: 1,
+      backend: IndexType.HNSW,
+      params: { type: IndexType.HNSW, dimension: params.dimension, metric, M, efConstruction },
+      size: chunks.length,
+      binary: path.basename(binaryPath),
+      chunks: chunks.map(chunk => ({
+        ...chunk,
+        embedding: [...chunk.embedding],
+        metadata: { ...chunk.metadata },
+        summaries: chunk.summaries.map(summary => ({ ...summary, concepts: [...summary.concepts] })),
+      })),
+      createdAt: new Date().toISOString(),
+    };
+
+    const tempPath = `${outputPath}.tmp`;
+    await fs.promises.writeFile(tempPath, JSON.stringify(sidecar, null, 2), 'utf-8');
+    await fs.promises.rename(tempPath, outputPath);
+    return true;
+  }
+
+  /**
+   * Approximate nearest-neighbour search over a persisted HNSW index.
+   *
+   * @param indexPath - Path to the HNSW sidecar written by {@link rebuildIndex}
+   * @param query - The query vector
+   * @param k - Number of neighbours to return
+   * @param efSearch - Optional search-time breadth (higher = more accurate/slower)
+   */
+  public async searchHnswIndex(indexPath: string, query: number[], k: number, efSearch?: number): Promise<IndexSearchHit[]> {
+    const sidecar = await this.readHnswArtifact(indexPath);
+    if (query.length !== sidecar.params.dimension) {
+      throw new Error(`Query dimension ${query.length} does not match index dimension ${sidecar.params.dimension}`);
+    }
+    if (sidecar.size === 0) {
+      return [];
+    }
+
+    const hnsw = await this.loadHnsw();
+    if (!hnsw) {
+      throw new Error('HNSW index present but hnswlib-node is unavailable to query it');
+    }
+
+    const index = new hnsw.HierarchicalNSW(this.hnswSpace(sidecar.params.metric), sidecar.params.dimension);
+    index.readIndexSync(path.join(path.dirname(indexPath), sidecar.binary));
+    if (typeof efSearch === 'number') {
+      index.setEf(efSearch);
+    }
+
+    const limit = Math.min(k, sidecar.size);
+    const { neighbors, distances } = index.searchKnn(query, limit);
+    return neighbors.map((label, i) => ({
+      chunk: sidecar.chunks[label],
+      score: this.scoreFromDistance(sidecar.params.metric, distances[i]),
+    })).filter(hit => !!hit.chunk);
+  }
+
+  private async readHnswArtifact(indexPath: string): Promise<HnswIndexArtifact> {
+    const data = await fs.promises.readFile(indexPath, 'utf-8');
+    const artifact = JSON.parse(data) as HnswIndexArtifact;
+    if (artifact.schemaVersion !== 1 || artifact.backend !== IndexType.HNSW || !Array.isArray(artifact.chunks)) {
+      throw new Error(`Invalid or unsupported HNSW index artifact: ${indexPath}`);
+    }
+    if (artifact.size !== artifact.chunks.length) {
+      throw new Error(`Corrupt HNSW index artifact: ${indexPath}`);
+    }
+    return artifact;
+  }
+
   private assertSupportedParams(params: IndexParams): void {
-    if (params.type !== IndexType.FLAT) {
-      throw new Error(`Index type "${params.type}" is not supported in this release; only flat exact indexing is implemented`);
+    if (params.type !== IndexType.FLAT && params.type !== IndexType.HNSW) {
+      throw new Error(`Index type "${params.type}" is not supported; use "flat" or "hnsw"`);
     }
 
     if (!Number.isInteger(params.dimension) || params.dimension <= 0) {
@@ -358,6 +503,34 @@ export class IndexManager {
     if (!['cosine', 'euclidean', 'dot'].includes(metric)) {
       throw new Error(`Unsupported metric: ${metric}`);
     }
+  }
+
+  /** Map our metric names onto hnswlib space identifiers. */
+  private hnswSpace(metric: string): 'cosine' | 'ip' | 'l2' {
+    if (metric === 'dot') return 'ip';
+    if (metric === 'euclidean') return 'l2';
+    return 'cosine';
+  }
+
+  /** Convert an hnswlib distance back into an ascending-is-better similarity score. */
+  private scoreFromDistance(metric: string, distance: number): number {
+    // cosine/ip distances are 1 - similarity; l2 is squared euclidean.
+    return metric === 'euclidean' ? 1 / (1 + distance) : 1 - distance;
+  }
+
+  private hnswModule: HnswModule | null | undefined;
+
+  /** Lazily load the native hnswlib module, caching the (possibly null) result. */
+  private async loadHnsw(): Promise<HnswModule | null> {
+    if (this.hnswModule !== undefined) {
+      return this.hnswModule;
+    }
+    try {
+      this.hnswModule = await import('hnswlib-node');
+    } catch {
+      this.hnswModule = null;
+    }
+    return this.hnswModule;
   }
 
   private assertChunkDimensions(chunks: Chunk[], dimension: number): void {
@@ -497,6 +670,19 @@ export function optimizeIndex(chunks: Chunk[], currentParams: IndexParams, optio
  */
 export function rebuildIndex(chunks: Chunk[], params: IndexParams, outputPath: string): Promise<boolean> {
   return indexManager.rebuildIndex(chunks, params, outputPath);
+}
+
+/**
+ * Utility function to run approximate nearest-neighbour search over an HNSW index
+ *
+ * @param indexPath - Path to the HNSW sidecar artifact
+ * @param query - The query vector
+ * @param k - Number of neighbours to return
+ * @param efSearch - Optional search-time breadth
+ * @returns The nearest chunks with similarity scores
+ */
+export function searchHnswIndex(indexPath: string, query: number[], k: number, efSearch?: number): Promise<IndexSearchHit[]> {
+  return indexManager.searchHnswIndex(indexPath, query, k, efSearch);
 }
 
 /**

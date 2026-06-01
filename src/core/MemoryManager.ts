@@ -7,6 +7,7 @@ import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
 import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
 import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './HierarchicalRetriever.js';
 import { buildNegationAwareQueryVector } from './NegationAwareRetrieval.js';
+import { SummarizationEngine } from '../summarization/SummarizationEngine.js';
 import path from 'path';
 import os from 'os';
 import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, deleteUserProfileMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, redactUserProfile, sanitizeChunkForExport, sanitizeUserProfileForExport, userProfileMatchesQuery } from '../utils/MemorySafety.js';
@@ -34,12 +35,21 @@ interface ManifestChunk {
   unhealthyReason?: string;
 }
 
+interface ManifestUserProfile {
+  profile: UserProfileMemory;
+  location?: ChunkLocation;
+}
+
 interface MemoryManifest {
   version: 1;
   updatedAt: string;
   providers: ManifestProvider[];
   buckets: ManifestBucket[];
   chunks: ManifestChunk[];
+  /** Manually-authored, safety-governed key/value profile facts. */
+  profileMemories?: ProfileMemory[];
+  /** Auto-extracted structured user profiles, with their provider location. */
+  userProfiles?: ManifestUserProfile[];
 }
 
 /**
@@ -68,6 +78,12 @@ export class MemoryManager {
   private isInitializing = false;
   private isShutdown = false;
   private manifestSaveQueue: Promise<void> = Promise.resolve();
+  // Cached hierarchical index; rebuilt lazily only when the chunk set changes,
+  // so repeated queries don't pay an O(n) index rebuild each time.
+  private cachedRetriever?: HierarchicalRetriever;
+  private retrieverDirty = true;
+  // Client-free extractive summarizer for chunk-level summaries.
+  private summarizer = new SummarizationEngine();
 
   /**
    * Create a new MemoryManager
@@ -196,7 +212,7 @@ export class MemoryManager {
       id: uuidv4(),
       ...config
     };
-    const bucket = new Bucket(fullConfig, undefined, () => this.persistManifestInBackground());
+    const bucket = new Bucket(fullConfig, undefined, () => this.onBucketChange());
     this.rootBuckets.set(bucket.getId(), bucket);
     this.persistManifestInBackground();
 
@@ -264,6 +280,7 @@ export class MemoryManager {
     }
 
     this.profileMemories.set(filteredProfile.id, filteredProfile);
+    this.persistManifestInBackground();
 
     const providers = Array.from(this.storageProviders.values())
       .sort((a, b) => {
@@ -296,6 +313,7 @@ export class MemoryManager {
         updatedAt: filteredProfile.updatedAt,
       });
       this.profileLocations.set(filteredProfile.id, location);
+      this.persistManifestInBackground();
       return location;
     }
 
@@ -331,6 +349,10 @@ export class MemoryManager {
       if (this.profileMemories.delete(profile.id)) {
         deleted += 1;
       }
+    }
+
+    if (deleted > 0) {
+      this.persistManifestInBackground();
     }
 
     return deleted;
@@ -455,6 +477,27 @@ export class MemoryManager {
   }
 
   /**
+   * Callback handed to every bucket: any chunk mutation both schedules a
+   * manifest write and invalidates the cached retriever.
+   */
+  private onBucketChange(): void {
+    this.retrieverDirty = true;
+    this.persistManifestInBackground();
+  }
+
+  /**
+   * Return the cached hierarchical retriever, rebuilding it only when the chunk
+   * set has changed since the last build.
+   */
+  private getRetriever(): HierarchicalRetriever {
+    if (this.retrieverDirty || !this.cachedRetriever) {
+      this.cachedRetriever = new HierarchicalRetriever(this.getAllChunks());
+      this.retrieverDirty = false;
+    }
+    return this.cachedRetriever;
+  }
+
+  /**
    * Search indexed memory with either legacy flat search or hierarchical routed retrieval.
    */
   public async searchMemory(
@@ -475,8 +518,7 @@ export class MemoryManager {
           ? await this.embeddingFunction!(query)
           : await buildNegationAwareQueryVector(query, this.embeddingFunction!))
       : query;
-    const chunks = this.getAllChunks();
-    const retriever = new HierarchicalRetriever(chunks);
+    const retriever = this.getRetriever();
 
     if (options.mode === 'flat') {
       return retriever.flatSearch(queryVector, options.k ?? options.finalK ?? 10);
@@ -681,6 +723,7 @@ export class MemoryManager {
     };
 
     this.safetyProfileMemories.set(profileMemory.id, profileMemory);
+    this.persistManifestInBackground();
     return profileMemory;
   }
 
@@ -776,6 +819,10 @@ export class MemoryManager {
       changed++;
     }
 
+    if (changed > 0) {
+      this.persistManifestInBackground();
+    }
+
     return { matched, changed };
   }
 
@@ -791,18 +838,10 @@ export class MemoryManager {
    * @returns An array of summaries at different levels
    */
   private async generateSummaries(content: string): Promise<ChunkSummary[]> {
-    // This is a placeholder implementation
-    // In a real implementation, this would use an LLM to generate summaries
-
-    const summary: ChunkSummary = {
-      level: 1,
-      content: content.length > 100
-        ? content.substring(0, 100) + '...'
-        : content,
-      concepts: []
-    };
-
-    return [summary];
+    // Use the extractive (client-free) summarizer for a real summary + concepts,
+    // rather than naive truncation. Callers that want LLM-quality multi-level
+    // summaries use InfiniteContext.summarize(), which supplies an LLM client.
+    return this.summarizer.summarize(content, 1);
   }
 
   /**
@@ -1039,7 +1078,12 @@ export class MemoryManager {
       updatedAt: new Date().toISOString(),
       providers: Array.from(this.storageProviders.values()).map((provider) => this.serializeProvider(provider)),
       buckets,
-      chunks
+      chunks,
+      profileMemories: Array.from(this.safetyProfileMemories.values()),
+      userProfiles: Array.from(this.profileMemories.values()).map((profile) => ({
+        profile,
+        location: this.profileLocations.get(profile.id),
+      })),
     };
   }
 
@@ -1118,6 +1162,27 @@ export class MemoryManager {
       const bucket = chunkBucketId ? restoredBuckets.get(chunkBucketId) : undefined;
       await this.restoreManifestChunk(manifestChunk, bucket);
     }
+
+    this.restoreProfileMemories(manifest.profileMemories || [], manifest.userProfiles || []);
+  }
+
+  private restoreProfileMemories(profileMemories: ProfileMemory[], userProfiles: ManifestUserProfile[]): void {
+    this.safetyProfileMemories.clear();
+    for (const memory of profileMemories) {
+      this.safetyProfileMemories.set(memory.id, memory);
+    }
+
+    this.profileMemories.clear();
+    this.profileLocations.clear();
+    for (const entry of userProfiles) {
+      if (!entry?.profile) {
+        continue;
+      }
+      this.profileMemories.set(entry.profile.id, entry.profile);
+      if (entry.location) {
+        this.profileLocations.set(entry.profile.id, entry.location);
+      }
+    }
   }
 
   private async restoreManifestProviders(providers: ManifestProvider[]): Promise<void> {
@@ -1139,7 +1204,7 @@ export class MemoryManager {
   }
 
   private deserializeBucket(manifestBucket: ManifestBucket, allBuckets: Map<string, Bucket>): Bucket {
-    const bucket = new Bucket(manifestBucket.config, undefined, () => this.persistManifestInBackground());
+    const bucket = new Bucket(manifestBucket.config, undefined, () => this.onBucketChange());
     allBuckets.set(bucket.getId(), bucket);
 
     for (const manifestSubBucket of manifestBucket.subBuckets || []) {

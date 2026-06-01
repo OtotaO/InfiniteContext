@@ -119,7 +119,7 @@ export class InfiniteContext {
     });
 
     // Create the summarization engine
-    this.summarizationEngine = new SummarizationEngine(options.openai);
+    this.summarizationEngine = new SummarizationEngine(options.openai, { model: this.llmModel });
 
     // Create the profile memory extractor for durable user-profile extraction.
     this.profileExtractor = new ProfileMemoryExtractor({ profilePrivacy: options.profileMemory });
