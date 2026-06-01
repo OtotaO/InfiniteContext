@@ -5,13 +5,20 @@ import { ChunkSummary } from '../core/types.js';
  * of detail, extracting key concepts, and identifying relationships between chunks.
  */
 export class SummarizationEngine {
-  private llmClient: any; // In a real implementation, this would be a proper LLM client
+  // An OpenAI-compatible client exposing `chat.completions.create`. When null,
+  // the engine uses deterministic extractive fallbacks.
+  private llmClient: any;
+  private model: string;
 
   /**
    * Create a new SummarizationEngine
+   *
+   * @param llmClient - An OpenAI-compatible client, or null for extractive mode
+   * @param options - Optional chat model name
    */
-  constructor(llmClient: any = null) {
+  constructor(llmClient: any = null, options: { model?: string } = {}) {
     this.llmClient = llmClient;
+    this.model = options.model || 'gpt-3.5-turbo';
   }
 
   /**
@@ -286,19 +293,24 @@ ${text}`;
    * @returns The LLM response text
    */
   private async llmRequest(prompt: string): Promise<string> {
-    if (!this.llmClient) {
+    if (!this.llmClient?.chat?.completions?.create) {
       throw new Error('No LLM client provided');
     }
-    
-    // This is a placeholder implementation
-    // In a real implementation, this would make a request to an LLM API
-    
-    try {
-      // Simulate an LLM response for the sake of the implementation
-      return `This is a simulated LLM response for the prompt: ${prompt.substring(0, 20)}...`;
-    } catch (error) {
-      console.error('Error making LLM request:', error);
-      throw error;
+
+    const response = await this.llmClient.chat.completions.create({
+      model: this.model,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'You are a precise summarization assistant. Respond with only the requested output and no preamble.' },
+        { role: 'user', content: prompt },
+      ],
+    });
+
+    const content = response?.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || content.trim().length === 0) {
+      throw new Error('LLM returned an empty response');
     }
+
+    return content.trim();
   }
 }
