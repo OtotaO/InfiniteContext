@@ -34,12 +34,21 @@ interface ManifestChunk {
   unhealthyReason?: string;
 }
 
+interface ManifestUserProfile {
+  profile: UserProfileMemory;
+  location?: ChunkLocation;
+}
+
 interface MemoryManifest {
   version: 1;
   updatedAt: string;
   providers: ManifestProvider[];
   buckets: ManifestBucket[];
   chunks: ManifestChunk[];
+  /** Manually-authored, safety-governed key/value profile facts. */
+  profileMemories?: ProfileMemory[];
+  /** Auto-extracted structured user profiles, with their provider location. */
+  userProfiles?: ManifestUserProfile[];
 }
 
 /**
@@ -264,6 +273,7 @@ export class MemoryManager {
     }
 
     this.profileMemories.set(filteredProfile.id, filteredProfile);
+    this.persistManifestInBackground();
 
     const providers = Array.from(this.storageProviders.values())
       .sort((a, b) => {
@@ -296,6 +306,7 @@ export class MemoryManager {
         updatedAt: filteredProfile.updatedAt,
       });
       this.profileLocations.set(filteredProfile.id, location);
+      this.persistManifestInBackground();
       return location;
     }
 
@@ -331,6 +342,10 @@ export class MemoryManager {
       if (this.profileMemories.delete(profile.id)) {
         deleted += 1;
       }
+    }
+
+    if (deleted > 0) {
+      this.persistManifestInBackground();
     }
 
     return deleted;
@@ -681,6 +696,7 @@ export class MemoryManager {
     };
 
     this.safetyProfileMemories.set(profileMemory.id, profileMemory);
+    this.persistManifestInBackground();
     return profileMemory;
   }
 
@@ -774,6 +790,10 @@ export class MemoryManager {
       matched++;
       this.profileMemories.set(profile.id, userProfileMutator(profile));
       changed++;
+    }
+
+    if (changed > 0) {
+      this.persistManifestInBackground();
     }
 
     return { matched, changed };
@@ -1039,7 +1059,12 @@ export class MemoryManager {
       updatedAt: new Date().toISOString(),
       providers: Array.from(this.storageProviders.values()).map((provider) => this.serializeProvider(provider)),
       buckets,
-      chunks
+      chunks,
+      profileMemories: Array.from(this.safetyProfileMemories.values()),
+      userProfiles: Array.from(this.profileMemories.values()).map((profile) => ({
+        profile,
+        location: this.profileLocations.get(profile.id),
+      })),
     };
   }
 
@@ -1117,6 +1142,27 @@ export class MemoryManager {
       const chunkBucketId = manifestChunk.bucketId || bucketChunkIds.get(manifestChunk.id);
       const bucket = chunkBucketId ? restoredBuckets.get(chunkBucketId) : undefined;
       await this.restoreManifestChunk(manifestChunk, bucket);
+    }
+
+    this.restoreProfileMemories(manifest.profileMemories || [], manifest.userProfiles || []);
+  }
+
+  private restoreProfileMemories(profileMemories: ProfileMemory[], userProfiles: ManifestUserProfile[]): void {
+    this.safetyProfileMemories.clear();
+    for (const memory of profileMemories) {
+      this.safetyProfileMemories.set(memory.id, memory);
+    }
+
+    this.profileMemories.clear();
+    this.profileLocations.clear();
+    for (const entry of userProfiles) {
+      if (!entry?.profile) {
+        continue;
+      }
+      this.profileMemories.set(entry.profile.id, entry.profile);
+      if (entry.location) {
+        this.profileLocations.set(entry.profile.id, entry.location);
+      }
     }
   }
 
