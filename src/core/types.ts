@@ -276,6 +276,12 @@ export interface UserProfileMemory {
   createdAt: string;
   updatedAt: string;
   lastObservedAt: string;
+  // Governance tombstones, so extracted profiles answer to the same
+  // redact/delete/export pipeline as chunks and manual profile facts.
+  deletionStatus?: DeletionStatus | string;
+  deletedAt?: string;
+  redactedAt?: string;
+  deletionReason?: string;
 }
 
 export interface UserProfilePrivacySettings {

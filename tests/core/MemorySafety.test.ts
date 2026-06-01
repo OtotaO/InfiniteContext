@@ -1,7 +1,38 @@
-import { DeletionStatus, RetentionPolicy, SensitivityLevel } from '../../src/core/types.js';
+import { DeletionStatus, RetentionPolicy, SensitivityLevel, UserProfileMemory } from '../../src/core/types.js';
 import { MemoryManager } from '../../src/core/MemoryManager.js';
 
 const embeddingFunction = async (text: string) => [text.length || 1, 1, 0];
+
+function buildProfile(userId: string): UserProfileMemory {
+  const now = new Date().toISOString();
+  return {
+    id: `profile-${userId}`,
+    userId,
+    preferences: [],
+    interests: [],
+    emotionalState: [
+      {
+        id: 'field-1',
+        category: 'emotionalState',
+        key: 'mood',
+        value: 'anxious about deadlines',
+        confidence: 0.9,
+        sourceEpisodeIds: ['ep1'],
+        traceIds: ['tr1'],
+        createdAt: now,
+        updatedAt: now,
+        lastObservedAt: now,
+      },
+    ],
+    behavioralPatterns: [],
+    sourceEpisodeIds: ['ep1'],
+    traceIds: ['tr1'],
+    confidence: 0.9,
+    createdAt: now,
+    updatedAt: now,
+    lastObservedAt: now,
+  };
+}
 
 describe('long-term memory safety controls', () => {
   it('filters expired and deleted chunks from retrieval-facing searches', async () => {
@@ -59,6 +90,34 @@ describe('long-term memory safety controls', () => {
     expect(manager.deleteMemories({ sensitivity: SensitivityLevel.RESTRICTED }, 'retention')).toEqual({ matched: 2, changed: 2 });
     expect(manager.listMemories({ userId: 'u1' }).chunks).toHaveLength(0);
     expect(manager.listMemories({ userId: 'u1', includeDeleted: true }).chunks[0].metadata.deletionStatus).toBe(DeletionStatus.DELETED);
+
+    await manager.shutdown();
+  });
+
+  it('governs extracted user profiles through the unified safety pipeline', async () => {
+    const manager = new MemoryManager({ embeddingFunction });
+    await manager.storeUserProfileMemory(buildProfile('u1'));
+    await manager.storeUserProfileMemory(buildProfile('u2'));
+
+    // Right-to-access: an export scoped to the user includes their inferred profile.
+    const exported = manager.exportMemories({ userId: 'u1' });
+    expect(exported.userProfiles).toHaveLength(1);
+    expect(exported.userProfiles[0].emotionalState[0].value).toBe('anxious about deadlines');
+
+    // Facet-scoped queries must NOT over-match profiles (profiles have no
+    // domain/tag/sensitivity), preserving targeted redaction semantics.
+    expect(manager.redactMemories({ userId: 'u1', sensitivity: SensitivityLevel.RESTRICTED }, 'x'))
+      .toEqual({ matched: 0, changed: 0 });
+
+    // Right-to-erasure: a user-scoped deletion reaches the inferred profile too.
+    expect(manager.deleteMemories({ userId: 'u1' }, 'user request')).toEqual({ matched: 1, changed: 1 });
+    expect(manager.getUserProfileMemories('u1')).toHaveLength(0);
+    expect(manager.getUserProfileMemories('u2')).toHaveLength(1);
+
+    // The tombstone is retained and value redacted for auditability.
+    const tombstone = manager.listMemories({ userId: 'u1', includeDeleted: true }).userProfiles[0];
+    expect(tombstone.deletionStatus).toBe(DeletionStatus.DELETED);
+    expect(tombstone.emotionalState[0].value).toBe('[REDACTED]');
 
     await manager.shutdown();
   });
