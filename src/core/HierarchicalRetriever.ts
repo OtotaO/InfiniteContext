@@ -6,6 +6,34 @@ import {
   HierarchyLevel,
   Vector
 } from './types.js';
+/**
+ * Dataset size at/above which the flat episode scan switches to an approximate
+ * (HNSW) index. Below this an exact linear scan is both fast and more accurate,
+ * so the ANN overhead isn't worth it.
+ */
+export const DEFAULT_ANN_THRESHOLD = 2_000;
+
+// Memoized native-module load. Dynamic import keeps this working under both the
+// ESM build and the CommonJS test transform; resolves to null when unavailable.
+let hnswModulePromise: Promise<any | null> | undefined;
+function loadHnswAsync(): Promise<any | null> {
+  if (!hnswModulePromise) {
+    hnswModulePromise = import('hnswlib-node')
+      .then((mod: any) => {
+        const lib = mod?.HierarchicalNSW ? mod : mod?.default;
+        return lib?.HierarchicalNSW ? lib : null;
+      })
+      .catch(() => null);
+  }
+  return hnswModulePromise;
+}
+
+interface EpisodeAnnIndex {
+  index: any;
+  // label i corresponds to records[i]
+  records: HierarchicalMemoryRecord[];
+  dimension: number;
+}
 
 export interface HierarchicalRetrieverOptions {
   domainK?: number;
@@ -39,11 +67,28 @@ export class HierarchicalRetriever {
     [HierarchyLevel.EPISODE]: []
   };
   private flatEpisodes: HierarchicalMemoryRecord[] = [];
+  private episodeAnn: EpisodeAnnIndex | null = null;
+  private readonly annThreshold: number;
+  // The ANN graph is built asynchronously (native module loaded via dynamic
+  // import); flat search uses the exact scan until it is ready.
+  private annReady: Promise<void> = Promise.resolve();
+  private annGeneration = 0;
 
-  constructor(chunks: Chunk[] = []) {
+  constructor(chunks: Chunk[] = [], options: { annThreshold?: number } = {}) {
+    this.annThreshold = options.annThreshold ?? DEFAULT_ANN_THRESHOLD;
     if (chunks.length > 0) {
       this.rebuild(chunks);
     }
+  }
+
+  /** Resolves once the approximate index build for the latest rebuild settles. */
+  public async ready(): Promise<void> {
+    await this.annReady;
+  }
+
+  /** Whether the flat episode scan is currently served by the approximate index. */
+  public usesApproximateEpisodeIndex(): boolean {
+    return this.episodeAnn !== null;
   }
 
   public rebuild(chunks: Chunk[]): void {
@@ -146,6 +191,44 @@ export class HierarchicalRetriever {
     }
 
     this.flatEpisodes = this.recordsByLevel[HierarchyLevel.EPISODE];
+    this.episodeAnn = null;
+    const generation = ++this.annGeneration;
+    this.annReady = this.buildEpisodeAnnIndex(this.flatEpisodes, generation);
+  }
+
+  /**
+   * Build an approximate (HNSW) index over episode embeddings for sub-linear
+   * flat retrieval. Leaves `episodeAnn` null (falling back to an exact scan)
+   * when the dataset is small, the native module is unavailable, or embeddings
+   * have an inconsistent/empty dimension. A generation guard prevents a slow
+   * build from clobbering a newer rebuild.
+   */
+  private async buildEpisodeAnnIndex(episodes: HierarchicalMemoryRecord[], generation: number): Promise<void> {
+    if (episodes.length < this.annThreshold) {
+      return;
+    }
+
+    const dimension = episodes[0].embedding.length;
+    if (dimension === 0 || episodes.some(episode => episode.embedding.length !== dimension)) {
+      return;
+    }
+
+    const hnsw = await loadHnswAsync();
+    if (!hnsw || generation !== this.annGeneration) {
+      return;
+    }
+
+    try {
+      const index = new hnsw.HierarchicalNSW('cosine', dimension);
+      index.initIndex(episodes.length, 16, 200);
+      episodes.forEach((episode, label) => index.addPoint(episode.embedding, label));
+      if (generation !== this.annGeneration) {
+        return;
+      }
+      this.episodeAnn = { index, records: episodes, dimension };
+    } catch {
+      // Any native failure degrades to the exact scan.
+    }
   }
 
   public search(queryVector: Vector, options: HierarchicalRetrieverOptions = {}): HierarchicalSearchResponse {
@@ -189,7 +272,11 @@ export class HierarchicalRetriever {
   }
 
   public flatSearch(queryVector: Vector, k: number = 10): HierarchicalSearchResponse {
-    const results = this.topK(this.flatEpisodes, queryVector, k)
+    const scored = this.episodeAnn
+      ? this.annTopK(this.episodeAnn, queryVector, k)
+      : this.topK(this.flatEpisodes, queryVector, k);
+
+    const results = scored
       .filter((episode): episode is ScoredRecord & { record: HierarchicalMemoryRecord & { chunk: Chunk } } => !!episode.record.chunk)
       .map(({ record, score }) => ({
         chunk: record.chunk,
@@ -224,6 +311,36 @@ export class HierarchicalRetriever {
 
     counts[childLevel] += scopedChildren.length;
     return this.topK(scopedChildren, queryVector, k * Math.max(1, parents.length));
+  }
+
+  /**
+   * Approximate top-K over the episode HNSW index. Falls back to the exact scan
+   * if the query dimension doesn't match or the native query throws.
+   */
+  private annTopK(ann: EpisodeAnnIndex, queryVector: Vector, k: number): ScoredRecord[] {
+    if (queryVector.length !== ann.dimension) {
+      return this.topK(this.flatEpisodes, queryVector, k);
+    }
+
+    const limit = Math.min(k, ann.records.length);
+    if (limit <= 0) {
+      return [];
+    }
+
+    try {
+      // Widen the search beam beyond k for better recall.
+      ann.index.setEf(Math.max(limit * 4, 64));
+      const { neighbors, distances } = ann.index.searchKnn(queryVector, limit);
+      return neighbors
+        .map((label: number, i: number) => ({
+          record: ann.records[label],
+          // cosine space distance is 1 - cosine similarity
+          score: 1 - distances[i],
+        }))
+        .filter((scored: ScoredRecord) => !!scored.record);
+    } catch {
+      return this.topK(this.flatEpisodes, queryVector, k);
+    }
   }
 
   private topK(records: HierarchicalMemoryRecord[], queryVector: Vector, k: number): ScoredRecord[] {
