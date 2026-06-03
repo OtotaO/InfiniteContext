@@ -68,9 +68,13 @@ export class HierarchicalRetriever {
   };
   private flatEpisodes: HierarchicalMemoryRecord[] = [];
   private episodeAnn: EpisodeAnnIndex | null = null;
+  // Per-trace local HNSW graphs (IVF+HNSW style): routed search queries only the
+  // local graph of each selected trace, which preserves recall far better than
+  // post-filtering a single global graph against a small routed subset.
+  private traceAnn: Map<string, EpisodeAnnIndex> = new Map();
   private readonly annThreshold: number;
-  // The ANN graph is built asynchronously (native module loaded via dynamic
-  // import); flat search uses the exact scan until it is ready.
+  // The ANN graphs are built asynchronously (native module loaded via dynamic
+  // import); search uses the exact scan until they are ready.
   private annReady: Promise<void> = Promise.resolve();
   private annGeneration = 0;
 
@@ -89,6 +93,11 @@ export class HierarchicalRetriever {
   /** Whether the flat episode scan is currently served by the approximate index. */
   public usesApproximateEpisodeIndex(): boolean {
     return this.episodeAnn !== null;
+  }
+
+  /** Number of traces large enough to be served by a local approximate index. */
+  public approximateTraceIndexCount(): number {
+    return this.traceAnn.size;
   }
 
   public rebuild(chunks: Chunk[]): void {
@@ -192,24 +201,23 @@ export class HierarchicalRetriever {
 
     this.flatEpisodes = this.recordsByLevel[HierarchyLevel.EPISODE];
     this.episodeAnn = null;
+    this.traceAnn = new Map();
     const generation = ++this.annGeneration;
-    this.annReady = this.buildEpisodeAnnIndex(this.flatEpisodes, generation);
+    this.annReady = this.buildAnnIndexes(this.flatEpisodes, generation);
   }
 
   /**
-   * Build an approximate (HNSW) index over episode embeddings for sub-linear
-   * flat retrieval. Leaves `episodeAnn` null (falling back to an exact scan)
-   * when the dataset is small, the native module is unavailable, or embeddings
-   * have an inconsistent/empty dimension. A generation guard prevents a slow
-   * build from clobbering a newer rebuild.
+   * Build approximate (HNSW) indexes for sub-linear retrieval:
+   *  - one global episode index for {@link flatSearch}, and
+   *  - one local index per trace large enough to warrant it, for routed search
+   *    (IVF+HNSW: route to the trace, then search its local graph).
+   *
+   * Stays on the exact scan when the dataset/trace is small, the native module
+   * is unavailable, or embeddings have an inconsistent dimension. A generation
+   * guard prevents a slow build from clobbering a newer rebuild.
    */
-  private async buildEpisodeAnnIndex(episodes: HierarchicalMemoryRecord[], generation: number): Promise<void> {
+  private async buildAnnIndexes(episodes: HierarchicalMemoryRecord[], generation: number): Promise<void> {
     if (episodes.length < this.annThreshold) {
-      return;
-    }
-
-    const dimension = episodes[0].embedding.length;
-    if (dimension === 0 || episodes.some(episode => episode.embedding.length !== dimension)) {
       return;
     }
 
@@ -218,16 +226,58 @@ export class HierarchicalRetriever {
       return;
     }
 
-    try {
-      const index = new hnsw.HierarchicalNSW('cosine', dimension);
-      index.initIndex(episodes.length, 16, 200);
-      episodes.forEach((episode, label) => index.addPoint(episode.embedding, label));
+    const global = this.makeAnnIndex(hnsw, episodes);
+    if (generation !== this.annGeneration) {
+      return;
+    }
+    this.episodeAnn = global;
+
+    // Group episodes by their parent trace and build a local graph per large trace.
+    const byTrace = new Map<string, HierarchicalMemoryRecord[]>();
+    for (const episode of episodes) {
+      const traceId = episode.parentId ?? '';
+      const group = byTrace.get(traceId);
+      if (group) {
+        group.push(episode);
+      } else {
+        byTrace.set(traceId, [episode]);
+      }
+    }
+
+    const traceAnn = new Map<string, EpisodeAnnIndex>();
+    for (const [traceId, records] of byTrace) {
+      if (records.length < this.annThreshold) {
+        continue;
+      }
+      const local = this.makeAnnIndex(hnsw, records);
       if (generation !== this.annGeneration) {
         return;
       }
-      this.episodeAnn = { index, records: episodes, dimension };
+      if (local) {
+        traceAnn.set(traceId, local);
+      }
+    }
+    this.traceAnn = traceAnn;
+  }
+
+  /**
+   * Build a single HNSW index over the given records (label i == records[i]).
+   * Returns null when the embedding dimension is empty/inconsistent or the
+   * native build throws.
+   */
+  private makeAnnIndex(hnsw: any, records: HierarchicalMemoryRecord[]): EpisodeAnnIndex | null {
+    const dimension = records[0]?.embedding.length ?? 0;
+    if (dimension === 0 || records.some(record => record.embedding.length !== dimension)) {
+      return null;
+    }
+
+    try {
+      const index = new hnsw.HierarchicalNSW('cosine', dimension);
+      index.initIndex(records.length, 16, 200);
+      records.forEach((record, label) => index.addPoint(record.embedding, label));
+      return { index, records, dimension };
     } catch {
-      // Any native failure degrades to the exact scan.
+      return null;
     }
   }
 
@@ -305,6 +355,13 @@ export class HierarchicalRetriever {
     counts: Record<HierarchyLevel, number>,
     childLevel: HierarchyLevel
   ): ScoredRecord[] {
+    // IVF+HNSW path: when routing to episodes and at least one selected trace has
+    // a local approximate index, query each trace's graph and merge, instead of
+    // scanning the whole scoped subset.
+    if (childLevel === HierarchyLevel.EPISODE && this.traceAnn.size > 0) {
+      return this.routeEpisodesWithAnn(parents, queryVector, k, counts);
+    }
+
     const scopedChildren = parents.flatMap(({ record }) => record.childIds)
       .map(id => this.recordsById.get(id))
       .filter((record): record is HierarchicalMemoryRecord => !!record && record.level === childLevel);
@@ -314,12 +371,45 @@ export class HierarchicalRetriever {
   }
 
   /**
+   * Route to episodes via per-trace local graphs: each selected trace
+   * contributes its top-k from its local HNSW index (or an exact scan if it has
+   * no local index), and the merged candidates are trimmed to the overall
+   * budget. This keeps recall high because each trace is searched in isolation.
+   */
+  private routeEpisodesWithAnn(
+    parents: ScoredRecord[],
+    queryVector: Vector,
+    k: number,
+    counts: Record<HierarchyLevel, number>
+  ): ScoredRecord[] {
+    const merged: ScoredRecord[] = [];
+
+    for (const { record: trace } of parents) {
+      const episodes = trace.childIds
+        .map(id => this.recordsById.get(id))
+        .filter((record): record is HierarchicalMemoryRecord => !!record && record.level === HierarchyLevel.EPISODE);
+
+      counts[HierarchyLevel.EPISODE] += episodes.length;
+
+      const local = this.traceAnn.get(trace.id);
+      const scored = local ? this.annTopK(local, queryVector, k) : this.topK(episodes, queryVector, k);
+      merged.push(...scored);
+    }
+
+    return merged
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k * Math.max(1, parents.length));
+  }
+
+  /**
    * Approximate top-K over the episode HNSW index. Falls back to the exact scan
    * if the query dimension doesn't match or the native query throws.
    */
   private annTopK(ann: EpisodeAnnIndex, queryVector: Vector, k: number): ScoredRecord[] {
+    // On a dimension mismatch or a native error, fall back to an exact scan over
+    // this index's own records (not the global episode set).
     if (queryVector.length !== ann.dimension) {
-      return this.topK(this.flatEpisodes, queryVector, k);
+      return this.topK(ann.records, queryVector, k);
     }
 
     const limit = Math.min(k, ann.records.length);
@@ -339,7 +429,7 @@ export class HierarchicalRetriever {
         }))
         .filter((scored: ScoredRecord) => !!scored.record);
     } catch {
-      return this.topK(this.flatEpisodes, queryVector, k);
+      return this.topK(ann.records, queryVector, k);
     }
   }
 
