@@ -30,4 +30,24 @@ describe('cached hierarchical retriever', () => {
 
     await manager.shutdown();
   });
+
+  it('invalidates the cache when a chunk is deleted so it stops being returned', async () => {
+    const manager = new MemoryManager({ embeddingFunction });
+    const bucket = manager.createBucket({ name: 'fruit', domain: 'food' });
+
+    const apple = await manager.createChunk('apple pie', { domain: 'food', source: 'test', tags: ['fruit'] });
+    bucket.addChunk(apple);
+
+    // Warm the cache: the chunk is retrievable.
+    const before = await manager.searchMemory('apple', { mode: 'flat', k: 5 });
+    expect(before.results.map(r => r.chunk.id)).toContain(apple.id);
+
+    // Deleting goes through bucket.updateChunk; the cache must rebuild and drop it.
+    manager.deleteMemories({}, 'test cleanup');
+
+    const after = await manager.searchMemory('apple', { mode: 'flat', k: 5 });
+    expect(after.results.map(r => r.chunk.id)).not.toContain(apple.id);
+
+    await manager.shutdown();
+  });
 });

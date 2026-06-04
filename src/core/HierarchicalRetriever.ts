@@ -67,6 +67,9 @@ export class HierarchicalRetriever {
     [HierarchyLevel.EPISODE]: []
   };
   private flatEpisodes: HierarchicalMemoryRecord[] = [];
+  // Running embedding sum + count per aggregate (domain/category/trace) id, so
+  // incremental appends can update averaged embeddings without a full rebuild.
+  private aggregateState: Map<string, { sum: number[]; count: number }> = new Map();
   private episodeAnn: EpisodeAnnIndex | null = null;
   // Per-trace local HNSW graphs (IVF+HNSW style): routed search queries only the
   // local graph of each selected trace, which preserves recall far better than
@@ -80,6 +83,9 @@ export class HierarchicalRetriever {
 
   constructor(chunks: Chunk[] = [], options: { annThreshold?: number } = {}) {
     this.annThreshold = options.annThreshold ?? DEFAULT_ANN_THRESHOLD;
+    // Keep flatEpisodes aliased to the episode bucket so incremental appends are
+    // visible even when the retriever starts empty (no rebuild runs).
+    this.flatEpisodes = this.recordsByLevel[HierarchyLevel.EPISODE];
     if (chunks.length > 0) {
       this.rebuild(chunks);
     }
@@ -118,17 +124,7 @@ export class HierarchicalRetriever {
     const traceVectors = new Map<string, Vector[]>();
 
     for (const chunk of chunks) {
-      const domain = chunk.metadata.domain || 'default';
-      const category = (chunk.metadata.category as string | undefined) || chunk.metadata.tags[0] || 'uncategorized';
-      const trace = (chunk.metadata.memoryTraceId as string | undefined)
-        || (chunk.metadata.traceId as string | undefined)
-        || (chunk.metadata.source as string | undefined)
-        || 'default-trace';
-
-      const domainId = this.makeId(HierarchyLevel.DOMAIN, [domain]);
-      const categoryId = this.makeId(HierarchyLevel.CATEGORY, [domain, category]);
-      const traceId = this.makeId(HierarchyLevel.MEMORY_TRACE, [domain, category, trace]);
-      const episodeId = chunk.id;
+      const { domainId, categoryId, traceId, episodeId } = this.deriveIds(chunk);
 
       this.addToSet(domainChildren, domainId, categoryId);
       this.addToSet(categoryChildren, categoryId, traceId);
@@ -199,11 +195,179 @@ export class HierarchicalRetriever {
       });
     }
 
+    // Seed running aggregate state so later incremental appends stay consistent.
+    this.aggregateState.clear();
+    for (const [id, vectors] of domainVectors) {
+      this.aggregateState.set(id, { sum: this.sumVectors(vectors), count: vectors.length });
+    }
+    for (const [id, vectors] of categoryVectors) {
+      this.aggregateState.set(id, { sum: this.sumVectors(vectors), count: vectors.length });
+    }
+    for (const [id, vectors] of traceVectors) {
+      this.aggregateState.set(id, { sum: this.sumVectors(vectors), count: vectors.length });
+    }
+
     this.flatEpisodes = this.recordsByLevel[HierarchyLevel.EPISODE];
     this.episodeAnn = null;
     this.traceAnn = new Map();
     const generation = ++this.annGeneration;
     this.annReady = this.buildAnnIndexes(this.flatEpisodes, generation);
+  }
+
+  /**
+   * Derive the four hierarchy ids for a chunk. Shared by full rebuild and
+   * incremental append so the two paths can never drift.
+   */
+  private deriveIds(chunk: Chunk): {
+    domain: string; category: string; trace: string;
+    domainId: string; categoryId: string; traceId: string; episodeId: string;
+  } {
+    const domain = chunk.metadata.domain || 'default';
+    const category = (chunk.metadata.category as string | undefined) || chunk.metadata.tags[0] || 'uncategorized';
+    const trace = (chunk.metadata.memoryTraceId as string | undefined)
+      || (chunk.metadata.traceId as string | undefined)
+      || (chunk.metadata.source as string | undefined)
+      || 'default-trace';
+
+    return {
+      domain, category, trace,
+      domainId: this.makeId(HierarchyLevel.DOMAIN, [domain]),
+      categoryId: this.makeId(HierarchyLevel.CATEGORY, [domain, category]),
+      traceId: this.makeId(HierarchyLevel.MEMORY_TRACE, [domain, category, trace]),
+      episodeId: chunk.id,
+    };
+  }
+
+  /**
+   * Incrementally add a single chunk, mirroring {@link rebuild} without an O(n)
+   * pass. Returns false when the append would require creating a *new* ANN graph
+   * (an index threshold is crossed) — the caller should fall back to a full
+   * rebuild, which handles graph creation and the async native-module load.
+   */
+  public addChunk(chunk: Chunk): boolean {
+    const { domain, category, trace, domainId, categoryId, traceId, episodeId } = this.deriveIds(chunk);
+
+    // A new global or per-trace graph would need to be created: defer to rebuild.
+    if (this.flatEpisodes.length + 1 >= this.annThreshold && !this.episodeAnn) {
+      return false;
+    }
+    const existingTrace = this.recordsById.get(traceId);
+    const traceCountAfter = (existingTrace?.childIds.length ?? 0) + 1;
+    if (traceCountAfter >= this.annThreshold && !this.traceAnn.has(traceId)) {
+      return false;
+    }
+
+    chunk.metadata.hierarchyLevel = HierarchyLevel.EPISODE;
+    chunk.metadata.parentId = traceId;
+    chunk.metadata.childIds = chunk.metadata.childIds || [];
+    chunk.hierarchy = {
+      level: HierarchyLevel.EPISODE,
+      parentId: traceId,
+      childIds: [],
+      path: [domainId, categoryId, traceId, episodeId]
+    };
+
+    const episode: HierarchicalMemoryRecord = {
+      id: episodeId,
+      level: HierarchyLevel.EPISODE,
+      label: chunk.content.slice(0, 80) || episodeId,
+      embedding: chunk.embedding,
+      parentId: traceId,
+      childIds: [],
+      metadata: { ...chunk.metadata },
+      chunk
+    };
+    this.upsertRecord(episode);
+
+    this.updateAggregate(domainId, HierarchyLevel.DOMAIN, encodeURIComponent(domain), undefined, categoryId, chunk.embedding);
+    this.updateAggregate(categoryId, HierarchyLevel.CATEGORY, encodeURIComponent(category), domainId, traceId, chunk.embedding);
+    this.updateAggregate(traceId, HierarchyLevel.MEMORY_TRACE, encodeURIComponent(trace), categoryId, episodeId, chunk.embedding);
+
+    // Keep existing ANN graphs in sync; invalidate to an exact scan on failure.
+    if (this.episodeAnn && !this.annAddPoint(this.episodeAnn, episode)) {
+      this.episodeAnn = null;
+    }
+    const localTrace = this.traceAnn.get(traceId);
+    if (localTrace && !this.annAddPoint(localTrace, episode)) {
+      this.traceAnn.delete(traceId);
+    }
+
+    return true;
+  }
+
+  /** Update (or create) an aggregate record's running-average embedding and child set. */
+  private updateAggregate(
+    id: string,
+    level: HierarchyLevel,
+    label: string,
+    parentId: string | undefined,
+    childId: string,
+    embedding: Vector
+  ): void {
+    let state = this.aggregateState.get(id);
+    if (!state) {
+      state = { sum: [...embedding], count: 1 };
+      this.aggregateState.set(id, state);
+    } else {
+      for (let i = 0; i < embedding.length; i++) {
+        state.sum[i] += embedding[i];
+      }
+      state.count += 1;
+    }
+
+    const average = state.sum.map(value => value / state!.count);
+    const record = this.recordsById.get(id);
+    if (record) {
+      record.embedding = average;
+      if (!record.childIds.includes(childId)) {
+        record.childIds.push(childId);
+      }
+    } else {
+      this.upsertRecord({
+        id,
+        level,
+        label,
+        embedding: average,
+        parentId,
+        childIds: [childId],
+        metadata: { hierarchyLevel: level }
+      });
+    }
+  }
+
+  /**
+   * Add a record's embedding to an existing HNSW index, growing capacity as
+   * needed. Returns false (leaving the index unchanged) on any native error so
+   * the caller can fall back to an exact scan.
+   */
+  private annAddPoint(ann: EpisodeAnnIndex, record: HierarchicalMemoryRecord): boolean {
+    if (record.embedding.length !== ann.dimension) {
+      return false;
+    }
+    try {
+      const maxElements = ann.index.getMaxElements();
+      if (ann.index.getCurrentCount() >= maxElements) {
+        ann.index.resizeIndex(Math.max(maxElements * 2, maxElements + 1));
+      }
+      ann.index.addPoint(record.embedding, ann.records.length);
+      ann.records.push(record);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private sumVectors(vectors: Vector[]): number[] {
+    if (vectors.length === 0) {
+      return [];
+    }
+    const sums = Array(vectors[0].length).fill(0);
+    for (const vector of vectors) {
+      for (let i = 0; i < vector.length; i++) {
+        sums[i] += vector[i];
+      }
+    }
+    return sums;
   }
 
   /**

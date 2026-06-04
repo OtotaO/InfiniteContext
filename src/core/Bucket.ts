@@ -3,6 +3,15 @@ import { Vector, Chunk, SearchResult, BucketConfig, MemoryFeedback, ChunkSummary
 import { VectorStore } from './VectorStore.js';
 
 /**
+ * Describes how a bucket changed, so listeners can update incrementally where
+ * possible (`add`) or fall back to a full rebuild (`mutate`, e.g. update/delete
+ * or structural changes).
+ */
+export type BucketChangeEvent =
+  | { type: 'add'; chunks: Chunk[] }
+  | { type: 'mutate' };
+
+/**
  * Bucket class for organizing chunks into domains and hierarchies.
  *
  * Buckets can contain chunks and sub-buckets, forming a hierarchical structure
@@ -16,7 +25,7 @@ export class Bucket {
   private vectorStore: VectorStore;
   private subBuckets: Map<string, Bucket> = new Map();
   private parentId?: string;
-  private onChange?: () => void;
+  private onChange?: (event: BucketChangeEvent) => void;
 
   /**
    * Create a new Bucket
@@ -25,7 +34,7 @@ export class Bucket {
    * @param vectorStore - Optional vector store to use (will create one if not provided)
    * @param onChange - Optional callback invoked when bucket contents or hierarchy change
    */
-  constructor(config: BucketConfig, vectorStore?: VectorStore, onChange?: () => void) {
+  constructor(config: BucketConfig, vectorStore?: VectorStore, onChange?: (event: BucketChangeEvent) => void) {
     this.id = config.id || uuidv4();
     this.name = config.name;
     this.domain = config.domain;
@@ -97,7 +106,7 @@ export class Bucket {
     chunk.metadata.bucketName = this.name;
     this.prepareChunkForHierarchy(chunk);
     const id = this.vectorStore.addChunk(chunk);
-    this.onChange?.();
+    this.onChange?.({ type: 'add', chunks: [chunk] });
     return id;
   }
 
@@ -115,7 +124,7 @@ export class Bucket {
       this.prepareChunkForHierarchy(chunk);
     }
     const ids = this.vectorStore.addChunks(chunks);
-    this.onChange?.();
+    this.onChange?.({ type: 'add', chunks });
     return ids;
   }
 
@@ -195,7 +204,7 @@ export class Bucket {
     };
     const subBucket = new Bucket(fullConfig, undefined, this.onChange);
     this.subBuckets.set(subBucket.getId(), subBucket);
-    this.onChange?.();
+    this.onChange?.({ type: 'mutate' });
 
     return subBucket;
   }
@@ -207,7 +216,7 @@ export class Bucket {
    */
   public addExistingSubBucket(bucket: Bucket): void {
     this.subBuckets.set(bucket.getId(), bucket);
-    this.onChange?.();
+    this.onChange?.({ type: 'mutate' });
   }
 
   /**
@@ -236,7 +245,7 @@ export class Bucket {
   public removeSubBucket(id: string): boolean {
     const removed = this.subBuckets.delete(id);
     if (removed) {
-      this.onChange?.();
+      this.onChange?.({ type: 'mutate' });
     }
     return removed;
   }
@@ -278,6 +287,8 @@ export class Bucket {
    */
   public updateChunk(chunk: Chunk, recursive: boolean = true): boolean {
     if (this.vectorStore.updateChunk(chunk)) {
+      // Content/metadata (and deletion markers) changed: listeners must rebuild.
+      this.onChange?.({ type: 'mutate' });
       return true;
     }
 
