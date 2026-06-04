@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import { v4 as uuidv4 } from 'uuid';
-import { Bucket } from './Bucket.js';
+import { Bucket, BucketChangeEvent } from './Bucket.js';
 import { BucketConfig, Chunk, ChunkLocation, ChunkSummary, MemoryFeedback, HierarchicalSearchResponse, Metadata, SearchResult, StorageTier, UserProfileMemory, UserProfileMemoryField, UserProfileMemoryFieldCategory, UserProfilePrivacySettings, UserProfileSnippet, DeletionStatus, MemoryMutationResult, MemoryQuery, ProfileMemory, Vector } from './types.js';
 import { StorageProvider } from '../providers/StorageProvider.js';
 import { LocalStorageProvider } from '../providers/LocalStorageProvider.js';
@@ -212,7 +212,7 @@ export class MemoryManager {
       id: uuidv4(),
       ...config
     };
-    const bucket = new Bucket(fullConfig, undefined, () => this.onBucketChange());
+    const bucket = new Bucket(fullConfig, undefined, (event) => this.onBucketChange(event));
     this.rootBuckets.set(bucket.getId(), bucket);
     this.persistManifestInBackground();
 
@@ -477,11 +477,23 @@ export class MemoryManager {
   }
 
   /**
-   * Callback handed to every bucket: any chunk mutation both schedules a
-   * manifest write and invalidates the cached retriever.
+   * Callback handed to every bucket: schedules a manifest write and keeps the
+   * cached retriever in sync. Plain appends are applied incrementally (no O(n)
+   * rebuild) when possible; everything else marks the retriever for rebuild.
    */
-  private onBucketChange(): void {
-    this.retrieverDirty = true;
+  private onBucketChange(event: BucketChangeEvent): void {
+    if (event.type === 'add' && this.cachedRetriever && !this.retrieverDirty) {
+      for (const chunk of event.chunks) {
+        if (!this.cachedRetriever.addChunk(chunk)) {
+          // The retriever couldn't absorb this append (e.g. an index threshold
+          // was crossed); fall back to a full rebuild on the next query.
+          this.retrieverDirty = true;
+          break;
+        }
+      }
+    } else {
+      this.retrieverDirty = true;
+    }
     this.persistManifestInBackground();
   }
 
@@ -1204,7 +1216,7 @@ export class MemoryManager {
   }
 
   private deserializeBucket(manifestBucket: ManifestBucket, allBuckets: Map<string, Bucket>): Bucket {
-    const bucket = new Bucket(manifestBucket.config, undefined, () => this.onBucketChange());
+    const bucket = new Bucket(manifestBucket.config, undefined, (event) => this.onBucketChange(event));
     allBuckets.set(bucket.getId(), bucket);
 
     for (const manifestSubBucket of manifestBucket.subBuckets || []) {
