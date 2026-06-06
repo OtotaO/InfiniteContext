@@ -1,5 +1,5 @@
 {
-  "name": "infinite-context",
+  "name": "@ototao/infinite-context",
   "version": "0.1.0",
   "description": "An extensible memory architecture providing virtually unlimited context for AI systems",
   "main": "dist/index.js",
@@ -14,7 +14,8 @@
     "test": "jest",
     "lint": "eslint 'src/**/*.{js,ts}'",
     "format": "prettier --write 'src/**/*.{js,ts}'",
-    "build:llamafile": "node scripts/build-llamafile.js"
+    "build:llamafile": "node scripts/build-llamafile.js",
+    "bench:retrieval": "node scripts/retrieval-benchmark.mjs"
   },
   "keywords": [
     "ai",
@@ -23,7 +24,7 @@
     "embeddings",
     "vector-store"
   ],
-  "author": "",
+  "author": "OtotaO",
   "license": "MIT",
   "dependencies": {
     "hnswlib-node": "^1.4.2",
