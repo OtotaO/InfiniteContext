@@ -1,0 +1,38 @@
+# lefthook.yml
+# ---------------------------------------------------------------------------
+# BILLING-IMMUNE LOCAL CI GATE
+# GitHub Actions gets account-level billing-blocked ("job not started /
+# payments failed / spending limit"), which silently kills CI across every
+# private repo at once. These Lefthook hooks run the SAME gate locally at
+# commit/push time, consuming ZERO CI minutes, so the gate keeps working even
+# when Actions is dead.
+#
+# The full gate is the EXACT mirror of .github/workflows/ci.yml:
+#     npm run build   (== tsc; this is the type-check + emit)
+#     npm test        (== jest)
+# CI and the hook call the same npm scripts, so they cannot drift.
+#
+# Bypass (use sparingly, e.g. WIP/docs-only commits):
+#     git commit --no-verify
+#     git push   --no-verify
+# ---------------------------------------------------------------------------
+
+pre-commit:
+  parallel: false
+  commands:
+    # Fast subset: type-check only (no emit), target < 10s.
+    # NOTE: `npm run lint` is intentionally NOT used here — the repo declares an
+    # eslint script but ships NO eslint config, so it would error. Add an
+    # .eslintrc + uncomment below once lint is configured.
+    typecheck:
+      run: npx tsc --noEmit
+    # lint:
+    #   glob: "src/**/*.{js,ts}"
+    #   run: npm run lint
+
+pre-push:
+  parallel: false
+  commands:
+    # FULL gate = exact mirror of CI. Target < 2 min.
+    gate:
+      run: npm run build && npm test
