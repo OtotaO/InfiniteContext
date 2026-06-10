@@ -8,6 +8,17 @@ import { MemoryMonitor, MemoryAlert } from './MemoryMonitor.js';
 import { HierarchicalRetriever, HierarchicalRetrieverOptions } from './HierarchicalRetriever.js';
 import { buildNegationAwareQueryVector } from './NegationAwareRetrieval.js';
 import { SummarizationEngine } from '../summarization/SummarizationEngine.js';
+import type { JsonWebKey } from 'crypto';
+import {
+  GovernanceOperation,
+  GovernanceReceipt,
+  ReceiptAffectedRecord,
+  ReceiptSigner,
+  hashContent,
+  receiptHash,
+  verifyReceipt,
+  verifyReceiptChain,
+} from '../governance/GovernanceReceipts.js';
 import path from 'path';
 import os from 'os';
 import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, deleteUserProfileMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, redactUserProfile, sanitizeChunkForExport, sanitizeUserProfileForExport, userProfileMatchesQuery } from '../utils/MemorySafety.js';
@@ -50,6 +61,8 @@ interface MemoryManifest {
   profileMemories?: ProfileMemory[];
   /** Auto-extracted structured user profiles, with their provider location. */
   userProfiles?: ManifestUserProfile[];
+  /** Append-only chain of signed governance receipts. */
+  governanceReceipts?: GovernanceReceipt[];
 }
 
 /**
@@ -84,6 +97,9 @@ export class MemoryManager {
   private retrieverDirty = true;
   // Client-free extractive summarizer for chunk-level summaries.
   private summarizer = new SummarizationEngine();
+  // Ed25519 identity + append-only chain of signed governance receipts.
+  private receiptSigner?: ReceiptSigner;
+  private governanceReceipts: GovernanceReceipt[] = [];
 
   /**
    * Create a new MemoryManager
@@ -133,6 +149,7 @@ export class MemoryManager {
       await localProvider.connect();
       this.addStorageProvider(localProvider);
 
+      await this.loadOrCreateSigningKey();
       await this.loadManifest();
     } finally {
       this.isInitializing = false;
@@ -759,10 +776,12 @@ export class MemoryManager {
    */
   public redactMemories(query: MemoryQuery, reason?: string): MemoryMutationResult {
     return this.mutateMemories(
+      'redact',
       query,
       chunk => redactChunk(chunk, reason),
       memory => redactProfileMemory(memory, reason),
-      profile => redactUserProfile(profile, reason)
+      profile => redactUserProfile(profile, reason),
+      reason
     );
   }
 
@@ -771,10 +790,12 @@ export class MemoryManager {
    */
   public deleteMemories(query: MemoryQuery, reason?: string): MemoryMutationResult {
     return this.mutateMemories(
+      'delete',
       { ...query, includeDeleted: true },
       chunk => deleteChunkMarker(chunk, reason),
       memory => deleteProfileMemoryMarker(memory, reason),
-      profile => deleteUserProfileMarker(profile, reason)
+      profile => deleteUserProfileMarker(profile, reason),
+      reason
     );
   }
 
@@ -783,7 +804,7 @@ export class MemoryManager {
    */
   public exportMemories(query: MemoryQuery = {}): { chunks: Chunk[]; profileMemories: ProfileMemory[]; userProfiles: UserProfileMemory[] } {
     const memories = this.listMemories({ ...query, includeDeleted: query.includeDeleted ?? false });
-    return {
+    const result = {
       chunks: memories.chunks
         .map(chunk => sanitizeChunkForExport(chunk, !!query.includeDeleted))
         .filter((chunk): chunk is Chunk => chunk !== null),
@@ -797,45 +818,153 @@ export class MemoryManager {
         .map(profile => sanitizeUserProfileForExport(profile, !!query.includeDeleted))
         .filter((profile): profile is UserProfileMemory => profile !== null),
     };
+
+    // Attest what was disclosed by an export (a data-subject access request is a
+    // governed operation under ADR 0001).
+    const affected: ReceiptAffectedRecord[] = [
+      ...result.chunks.map((chunk): ReceiptAffectedRecord => ({ id: chunk.id, type: 'chunk', beforeHash: hashContent(chunk.content) })),
+      ...result.profileMemories.map((memory): ReceiptAffectedRecord => ({ id: memory.id, type: 'profile-memory', beforeHash: hashContent(this.stringifyForHashValue(memory.value)) })),
+      ...result.userProfiles.map((profile): ReceiptAffectedRecord => ({ id: profile.id, type: 'user-profile', beforeHash: hashContent(JSON.stringify(profile.preferences ?? [])) })),
+    ];
+    const total = affected.length;
+    this.recordGovernanceReceipt('export', total, total, affected);
+    if (total > 0) {
+      this.persistManifestInBackground();
+    }
+
+    return result;
   }
 
   private mutateMemories(
+    operation: GovernanceOperation,
     query: MemoryQuery,
     chunkMutator: (chunk: Chunk) => Chunk,
     profileMutator: (memory: ProfileMemory) => ProfileMemory,
-    userProfileMutator: (profile: UserProfileMemory) => UserProfileMemory
+    userProfileMutator: (profile: UserProfileMemory) => UserProfileMemory,
+    reason?: string
   ): MemoryMutationResult {
     let matched = 0;
     let changed = 0;
+    const affected: ReceiptAffectedRecord[] = [];
 
     for (const bucket of this.rootBuckets.values()) {
       for (const chunk of bucket.getAllChunks(true, true)) {
         if (!memoryMatchesQuery(chunk, query)) continue;
         matched++;
+        const beforeHash = hashContent(chunk.content);
         const updated = chunkMutator(chunk);
-        if (bucket.updateChunk(updated, true)) changed++;
+        if (bucket.updateChunk(updated, true)) {
+          changed++;
+          affected.push({ id: chunk.id, type: 'chunk', beforeHash, afterHash: hashContent(updated.content) });
+        }
       }
     }
 
     for (const memory of this.safetyProfileMemories.values()) {
       if (!memoryMatchesQuery(memory, query)) continue;
       matched++;
-      this.safetyProfileMemories.set(memory.id, profileMutator(memory));
+      const beforeHash = hashContent(this.stringifyForHashValue(memory.value));
+      const updated = profileMutator(memory);
+      this.safetyProfileMemories.set(memory.id, updated);
       changed++;
+      affected.push({ id: memory.id, type: 'profile-memory', beforeHash, afterHash: hashContent(this.stringifyForHashValue(updated.value)) });
     }
 
     for (const profile of this.profileMemories.values()) {
       if (!userProfileMatchesQuery(profile, query)) continue;
       matched++;
-      this.profileMemories.set(profile.id, userProfileMutator(profile));
+      const beforeHash = hashContent(JSON.stringify(profile.preferences ?? []));
+      const updated = userProfileMutator(profile);
+      this.profileMemories.set(profile.id, updated);
       changed++;
+      affected.push({ id: profile.id, type: 'user-profile', beforeHash, afterHash: hashContent(JSON.stringify(updated.preferences ?? [])) });
     }
 
     if (changed > 0) {
+      this.recordGovernanceReceipt(operation, matched, changed, affected, reason);
       this.persistManifestInBackground();
     }
 
     return { matched, changed };
+  }
+
+  /**
+   * Append a signed, chained governance receipt for a governed operation. The
+   * receipt's `prev` references the previous receipt's hash, so any later
+   * tampering with the chain is detectable against {@link getSigningPublicJwk}.
+   */
+  private recordGovernanceReceipt(
+    operation: GovernanceOperation,
+    matched: number,
+    changed: number,
+    affected: ReceiptAffectedRecord[],
+    reason?: string
+  ): void {
+    if (!this.receiptSigner) {
+      return;
+    }
+
+    const prev = this.governanceReceipts.length > 0
+      ? receiptHash(this.governanceReceipts[this.governanceReceipts.length - 1])
+      : null;
+
+    const receipt = this.receiptSigner.sign({
+      schema: 'infinitecontext.governance_receipt.v1',
+      operation,
+      timestamp: new Date().toISOString(),
+      reason,
+      matched,
+      changed,
+      affected,
+      prev,
+    });
+
+    this.governanceReceipts.push(receipt);
+  }
+
+  /**
+   * The append-only chain of signed governance receipts (defensive copy).
+   */
+  public getGovernanceReceipts(): GovernanceReceipt[] {
+    return this.governanceReceipts.map(receipt => ({ ...receipt, payload: { ...receipt.payload } }));
+  }
+
+  /** Public key material (JWK + kid) for offline receipt verification. */
+  public getSigningPublicJwk(): (JsonWebKey & { kid: string }) | undefined {
+    return this.receiptSigner?.publicJwk();
+  }
+
+  /** Verify a single receipt against this instance's signing key. */
+  public verifyGovernanceReceipt(receipt: GovernanceReceipt): boolean {
+    return this.receiptSigner ? verifyReceipt(receipt, this.receiptSigner.publicKey) : false;
+  }
+
+  /**
+   * Verify the full receipt chain (signatures + prev links). Returns the index
+   * of the first broken receipt, or -1 when the chain is intact.
+   */
+  public verifyGovernanceReceiptChain(): number {
+    return this.receiptSigner ? verifyReceiptChain(this.governanceReceipts, this.receiptSigner.publicKey) : 0;
+  }
+
+  /** Coerce an arbitrary stored value into a stable string for content hashing. */
+  private stringifyForHashValue(value: unknown): string {
+    return typeof value === 'string' ? value : JSON.stringify(value ?? null);
+  }
+
+  private async loadOrCreateSigningKey(): Promise<void> {
+    const keyPath = path.join(this.basePath, 'governance', 'signing-key.pem');
+    try {
+      const pem = await fs.readFile(keyPath, 'utf-8');
+      this.receiptSigner = ReceiptSigner.fromPrivateKeyPem(pem);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') {
+        console.warn(`Failed to load governance signing key; regenerating: ${error}`);
+      }
+      this.receiptSigner = ReceiptSigner.generate();
+      await fs.mkdir(path.dirname(keyPath), { recursive: true });
+      await fs.writeFile(keyPath, this.receiptSigner.exportPrivateKeyPem(), { encoding: 'utf-8', mode: 0o600 });
+    }
   }
 
   private async calculateChunkHash(chunk: Chunk): Promise<string> {
@@ -1096,6 +1225,7 @@ export class MemoryManager {
         profile,
         location: this.profileLocations.get(profile.id),
       })),
+      governanceReceipts: this.governanceReceipts,
     };
   }
 
@@ -1176,6 +1306,7 @@ export class MemoryManager {
     }
 
     this.restoreProfileMemories(manifest.profileMemories || [], manifest.userProfiles || []);
+    this.governanceReceipts = manifest.governanceReceipts || [];
   }
 
   private restoreProfileMemories(profileMemories: ProfileMemory[], userProfiles: ManifestUserProfile[]): void {
