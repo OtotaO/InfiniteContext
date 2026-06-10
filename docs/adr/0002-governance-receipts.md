@@ -39,9 +39,14 @@ emits an **append-only, signed governance receipt**.
   receipt invalidates every receipt after it.
 - **Storage**: receipts are persisted in the manifest and reloaded on restart;
   the signing key persists alongside, so old receipts keep verifying.
-- **API**: `getGovernanceReceipts()`, `getSigningPublicJwk()` (public material
-  for offline verification), `verifyGovernanceReceipt()`, and
-  `verifyGovernanceReceiptChain()`.
+- **API**: `getGovernanceReceipts()`, `getSigningPublicJwk()` (active key) and
+  `getSigningJwks()` (full JWKS for offline verification), `verifyGovernanceReceipt()`,
+  `verifyGovernanceReceiptChain()`, and `rotateSigningKey()`.
+- **Key rotation**: `rotateSigningKey()` generates a fresh active key and retires
+  the previous one. Retired keys are retained in the on-disk keyring
+  (`<basePath>/governance/keyring.json` + `keys/<kid>.pem`), so receipts signed
+  before a rotation still verify; chain verification resolves each receipt's key
+  by its `kid`. A pre-rotation single `signing-key.pem` is migrated on load.
 
 ## Trust boundary
 
@@ -60,4 +65,4 @@ deliberately separate concern and out of scope here.
 - One new on-disk secret (the signing key) per instance, with the usual key-loss
   caveat: lose it and historical receipts can no longer be verified (though their
   content remains in the manifest).
-- In-place incremental deletes and key rotation are natural follow-ups.
+- In-place incremental deletes are a natural follow-up.

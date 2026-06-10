@@ -153,19 +153,32 @@ export function verifyReceipt(receipt: GovernanceReceipt, publicKey: KeyObject |
   }
 }
 
+/** Resolves the public key for a receipt's `kid` (supports rotated keyrings). */
+export type KeyResolver = (kid: string) => KeyObject | JsonWebKey | undefined;
+
 /**
- * Verify an ordered chain of receipts: every signature is valid and every
- * `prev` correctly references the hash of the preceding receipt. Returns the
- * index of the first broken receipt, or -1 if the whole chain is intact.
+ * Verify an ordered chain of receipts, resolving each receipt's key by its
+ * `kid` so chains spanning a key rotation still verify. Every signature must be
+ * valid and every `prev` must reference the hash of the preceding receipt.
+ * Returns the index of the first broken receipt, or -1 if the chain is intact.
  */
-export function verifyReceiptChain(receipts: GovernanceReceipt[], publicKey: KeyObject | JsonWebKey): number {
+export function verifyReceiptChainWith(receipts: GovernanceReceipt[], resolve: KeyResolver): number {
   let prev: string | null = null;
   for (let i = 0; i < receipts.length; i++) {
     const receipt = receipts[i];
-    if (receipt.payload.prev !== prev || !verifyReceipt(receipt, publicKey)) {
+    const key = resolve(receipt.kid);
+    if (!key || receipt.payload.prev !== prev || !verifyReceipt(receipt, key)) {
       return i;
     }
     prev = receiptHash(receipt);
   }
   return -1;
+}
+
+/**
+ * Verify an ordered chain against a single key. Convenience wrapper over
+ * {@link verifyReceiptChainWith} for the non-rotated case.
+ */
+export function verifyReceiptChain(receipts: GovernanceReceipt[], publicKey: KeyObject | JsonWebKey): number {
+  return verifyReceiptChainWith(receipts, () => publicKey);
 }
