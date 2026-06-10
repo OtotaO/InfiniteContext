@@ -1,5 +1,5 @@
 {
-  "name": "infinite-context",
+  "name": "@ototao/infinite-context",
   "version": "0.1.0",
   "description": "An extensible memory architecture providing virtually unlimited context for AI systems",
   "main": "dist/index.js",
@@ -24,7 +24,7 @@
     "embeddings",
     "vector-store"
   ],
-  "author": "",
+  "author": "OtotaO",
   "license": "MIT",
   "dependencies": {
     "archiver": "^6.0.1",

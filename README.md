@@ -25,13 +25,13 @@ InfiniteContext is a TypeScript library that provides a structured way to store,
 ## Installation
 
 ```bash
-npm install infinite-context
+npm install @ototao/infinite-context
 ```
 
 ## Basic Usage
 
 ```typescript
-import { InfiniteContext } from 'infinite-context';
+import { InfiniteContext } from '@ototao/infinite-context';
 import { OpenAI } from 'openai';
 
 // Create an OpenAI client for embeddings and summarization
@@ -135,6 +135,8 @@ InfiniteContext's first functional release does **not** support approximate vect
 - `<path>.index.json` for a real flat index artifact containing indexed ids, positions, embeddings, and chunks
 
 `IndexManager` supports exact flat index rebuild, merge, split, save, and load artifact workflows. `IndexType.HNSW` and `IndexType.IVF` remain reserved enum values for future backends; operations using those types return `false` or throw through validation paths instead of reporting fake success.
+
+For a quantified comparison of exact flat search against an approximate HNSW index (recall@k and p50/p95 latency at 1k/10k/100k synthetic vectors), see [`docs/retrieval-benchmark.md`](docs/retrieval-benchmark.md). Run it with `npm run bench:retrieval`.
 
 ## Storage Providers
 
