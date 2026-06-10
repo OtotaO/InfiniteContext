@@ -17,7 +17,7 @@ import {
   hashContent,
   receiptHash,
   verifyReceipt,
-  verifyReceiptChain,
+  verifyReceiptChainWith,
 } from '../governance/GovernanceReceipts.js';
 import path from 'path';
 import os from 'os';
@@ -97,8 +97,11 @@ export class MemoryManager {
   private retrieverDirty = true;
   // Client-free extractive summarizer for chunk-level summaries.
   private summarizer = new SummarizationEngine();
-  // Ed25519 identity + append-only chain of signed governance receipts.
-  private receiptSigner?: ReceiptSigner;
+  // Ed25519 keyring (kid -> signer) + the active signing kid, plus the
+  // append-only chain of signed governance receipts. Retired keys are retained
+  // so receipts signed before a rotation still verify.
+  private signers: Map<string, ReceiptSigner> = new Map();
+  private activeKid?: string;
   private governanceReceipts: GovernanceReceipt[] = [];
 
   /**
@@ -149,7 +152,7 @@ export class MemoryManager {
       await localProvider.connect();
       this.addStorageProvider(localProvider);
 
-      await this.loadOrCreateSigningKey();
+      await this.loadOrCreateKeyring();
       await this.loadManifest();
     } finally {
       this.isInitializing = false;
@@ -900,7 +903,8 @@ export class MemoryManager {
     affected: ReceiptAffectedRecord[],
     reason?: string
   ): void {
-    if (!this.receiptSigner) {
+    const signer = this.activeSigner();
+    if (!signer) {
       return;
     }
 
@@ -908,7 +912,7 @@ export class MemoryManager {
       ? receiptHash(this.governanceReceipts[this.governanceReceipts.length - 1])
       : null;
 
-    const receipt = this.receiptSigner.sign({
+    const receipt = signer.sign({
       schema: 'infinitecontext.governance_receipt.v1',
       operation,
       timestamp: new Date().toISOString(),
@@ -929,22 +933,50 @@ export class MemoryManager {
     return this.governanceReceipts.map(receipt => ({ ...receipt, payload: { ...receipt.payload } }));
   }
 
-  /** Public key material (JWK + kid) for offline receipt verification. */
+  /** The active signing identity's public key material (JWK + kid). */
   public getSigningPublicJwk(): (JsonWebKey & { kid: string }) | undefined {
-    return this.receiptSigner?.publicJwk();
-  }
-
-  /** Verify a single receipt against this instance's signing key. */
-  public verifyGovernanceReceipt(receipt: GovernanceReceipt): boolean {
-    return this.receiptSigner ? verifyReceipt(receipt, this.receiptSigner.publicKey) : false;
+    return this.activeSigner()?.publicJwk();
   }
 
   /**
-   * Verify the full receipt chain (signatures + prev links). Returns the index
-   * of the first broken receipt, or -1 when the chain is intact.
+   * Full JWK set (active + retired keys) for offline verification of receipts
+   * signed before/after any key rotation. Suitable for publishing as JWKS.
+   */
+  public getSigningJwks(): Array<JsonWebKey & { kid: string }> {
+    return Array.from(this.signers.values()).map(signer => signer.publicJwk());
+  }
+
+  /** Verify a single receipt against whichever keyring key signed it (by kid). */
+  public verifyGovernanceReceipt(receipt: GovernanceReceipt): boolean {
+    const key = this.signers.get(receipt.kid)?.publicKey;
+    return key ? verifyReceipt(receipt, key) : false;
+  }
+
+  /**
+   * Verify the full receipt chain (signatures + prev links), resolving each
+   * receipt's key by kid so chains spanning a rotation still verify. Returns the
+   * index of the first broken receipt, or -1 when the chain is intact.
    */
   public verifyGovernanceReceiptChain(): number {
-    return this.receiptSigner ? verifyReceiptChain(this.governanceReceipts, this.receiptSigner.publicKey) : 0;
+    return verifyReceiptChainWith(this.governanceReceipts, kid => this.signers.get(kid)?.publicKey);
+  }
+
+  /**
+   * Rotate the signing key: generate a fresh Ed25519 identity, make it active,
+   * and retain the previous keys so older receipts remain verifiable. Returns
+   * the new active kid.
+   */
+  public async rotateSigningKey(): Promise<string> {
+    const signer = ReceiptSigner.generate();
+    this.signers.set(signer.kid, signer);
+    this.activeKid = signer.kid;
+    await this.persistSigner(signer);
+    await this.writeKeyring();
+    return signer.kid;
+  }
+
+  private activeSigner(): ReceiptSigner | undefined {
+    return this.activeKid ? this.signers.get(this.activeKid) : undefined;
   }
 
   /** Coerce an arbitrary stored value into a stable string for content hashing. */
@@ -952,19 +984,71 @@ export class MemoryManager {
     return typeof value === 'string' ? value : JSON.stringify(value ?? null);
   }
 
-  private async loadOrCreateSigningKey(): Promise<void> {
-    const keyPath = path.join(this.basePath, 'governance', 'signing-key.pem');
+  private governanceDir(): string {
+    return path.join(this.basePath, 'governance');
+  }
+
+  private async persistSigner(signer: ReceiptSigner): Promise<void> {
+    const keysDir = path.join(this.governanceDir(), 'keys');
+    await fs.mkdir(keysDir, { recursive: true });
+    await fs.writeFile(path.join(keysDir, `${signer.kid}.pem`), signer.exportPrivateKeyPem(), { encoding: 'utf-8', mode: 0o600 });
+  }
+
+  private async writeKeyring(): Promise<void> {
+    const keyring = { activeKid: this.activeKid, kids: Array.from(this.signers.keys()) };
+    await fs.mkdir(this.governanceDir(), { recursive: true });
+    await fs.writeFile(path.join(this.governanceDir(), 'keyring.json'), JSON.stringify(keyring, null, 2), 'utf-8');
+  }
+
+  /**
+   * Load the governance keyring (all keys + the active kid), migrating a legacy
+   * single `signing-key.pem` if present, and generating a fresh key on first run.
+   */
+  private async loadOrCreateKeyring(): Promise<void> {
+    const dir = this.governanceDir();
+
+    // Preferred: a keyring with one PEM per kid.
     try {
-      const pem = await fs.readFile(keyPath, 'utf-8');
-      this.receiptSigner = ReceiptSigner.fromPrivateKeyPem(pem);
+      const keyring = JSON.parse(await fs.readFile(path.join(dir, 'keyring.json'), 'utf-8')) as { activeKid?: string; kids?: string[] };
+      for (const kid of keyring.kids ?? []) {
+        try {
+          const pem = await fs.readFile(path.join(dir, 'keys', `${kid}.pem`), 'utf-8');
+          const signer = ReceiptSigner.fromPrivateKeyPem(pem);
+          this.signers.set(signer.kid, signer);
+        } catch (error) {
+          console.warn(`Failed to load governance key ${kid}: ${error}`);
+        }
+      }
+      this.activeKid = keyring.activeKid && this.signers.has(keyring.activeKid)
+        ? keyring.activeKid
+        : Array.from(this.signers.keys())[0];
+      if (this.activeKid) {
+        return;
+      }
     } catch (error: any) {
       if (error?.code !== 'ENOENT') {
-        console.warn(`Failed to load governance signing key; regenerating: ${error}`);
+        console.warn(`Failed to load governance keyring; reinitializing: ${error}`);
       }
-      this.receiptSigner = ReceiptSigner.generate();
-      await fs.mkdir(path.dirname(keyPath), { recursive: true });
-      await fs.writeFile(keyPath, this.receiptSigner.exportPrivateKeyPem(), { encoding: 'utf-8', mode: 0o600 });
     }
+
+    // Migrate a legacy single-key file written before key rotation existed.
+    try {
+      const legacy = await fs.readFile(path.join(dir, 'signing-key.pem'), 'utf-8');
+      const signer = ReceiptSigner.fromPrivateKeyPem(legacy);
+      this.signers.set(signer.kid, signer);
+      this.activeKid = signer.kid;
+      await this.persistSigner(signer);
+      await this.writeKeyring();
+      return;
+    } catch {
+      // No legacy key; fall through to fresh generation.
+    }
+
+    const signer = ReceiptSigner.generate();
+    this.signers.set(signer.kid, signer);
+    this.activeKid = signer.kid;
+    await this.persistSigner(signer);
+    await this.writeKeyring();
   }
 
   private async calculateChunkHash(chunk: Chunk): Promise<string> {

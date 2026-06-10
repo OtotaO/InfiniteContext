@@ -45,6 +45,50 @@ describe('governance receipts in MemoryManager', () => {
     }
   });
 
+  it('rotates the signing key while keeping pre-rotation receipts verifiable', async () => {
+    const basePath = await fs.mkdtemp(path.join(os.tmpdir(), 'ic-receipts-'));
+    try {
+      const manager = new MemoryManager({ basePath, embeddingFunction });
+      await manager.initialize({ localStoragePath: path.join(basePath, 'storage') });
+      const bucket = manager.createBucket({ name: 'notes', domain: 'personal' });
+
+      const a = await manager.createChunk('first', { domain: 'personal', source: 'test', tags: [] });
+      bucket.addChunk(a);
+      manager.deleteMemories({ tags: ['none'] }, 'noop'); // matches nothing
+      manager.redactMemories({}, 'before rotation');
+      const oldKid = manager.getSigningPublicJwk()!.kid;
+      const receiptBefore = manager.getGovernanceReceipts()[0];
+      expect(receiptBefore.kid).toBe(oldKid);
+
+      const newKid = await manager.rotateSigningKey();
+      expect(newKid).not.toBe(oldKid);
+
+      // A post-rotation operation is signed by the new key...
+      const b = await manager.createChunk('second', { domain: 'personal', source: 'test', tags: [] });
+      bucket.addChunk(b);
+      manager.deleteMemories({}, 'after rotation');
+      const receipts = manager.getGovernanceReceipts();
+      expect(receipts[receipts.length - 1].kid).toBe(newKid);
+
+      // ...the old receipt still verifies (retired key retained), and the whole
+      // chain spanning the rotation verifies, resolved by kid.
+      expect(manager.verifyGovernanceReceipt(receiptBefore)).toBe(true);
+      expect(manager.verifyGovernanceReceiptChain()).toBe(-1);
+      // JWKS exposes both keys for offline verification.
+      expect(manager.getSigningJwks().map(j => j.kid).sort()).toEqual([oldKid, newKid].sort());
+
+      // Rotation survives a restart: both keys load, the new one stays active.
+      await manager.shutdown();
+      const restarted = new MemoryManager({ basePath, embeddingFunction });
+      await restarted.initialize({ localStoragePath: path.join(basePath, 'storage') });
+      expect(restarted.getSigningPublicJwk()!.kid).toBe(newKid);
+      expect(restarted.verifyGovernanceReceiptChain()).toBe(-1);
+      await restarted.shutdown();
+    } finally {
+      await fs.rm(basePath, { recursive: true, force: true });
+    }
+  });
+
   it('persists receipts and the signing key across a restart, keeping them verifiable', async () => {
     const basePath = await fs.mkdtemp(path.join(os.tmpdir(), 'ic-receipts-'));
     try {
