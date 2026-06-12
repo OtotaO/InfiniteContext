@@ -21,7 +21,7 @@ import {
 } from '../governance/GovernanceReceipts.js';
 import path from 'path';
 import os from 'os';
-import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, deleteUserProfileMarker, memoryMatchesQuery, redactChunk, redactProfileMemory, redactUserProfile, sanitizeChunkForExport, sanitizeUserProfileForExport, userProfileMatchesQuery } from '../utils/MemorySafety.js';
+import { defaultRetentionFields, deleteChunkMarker, deleteProfileMemoryMarker, deleteUserProfileMarker, isRetrievable, memoryMatchesQuery, redactChunk, redactProfileMemory, redactUserProfile, sanitizeChunkForExport, sanitizeUserProfileForExport, userProfileMatchesQuery } from '../utils/MemorySafety.js';
 
 interface ManifestProvider {
   id: string;
@@ -523,7 +523,11 @@ export class MemoryManager {
    */
   private getRetriever(): HierarchicalRetriever {
     if (this.retrieverDirty || !this.cachedRetriever) {
-      this.cachedRetriever = new HierarchicalRetriever(this.getAllChunks());
+      // Only index live, scorable chunks: deleted/expired/redacted memories (the
+      // latter carry an empty embedding) must not be ranked or surfaced, and an
+      // empty embedding would otherwise corrupt the hierarchy aggregates.
+      const indexable = this.getAllChunks().filter(chunk => isRetrievable(chunk) && chunk.embedding.length > 0);
+      this.cachedRetriever = new HierarchicalRetriever(indexable);
       this.retrieverDirty = false;
     }
     return this.cachedRetriever;
@@ -671,6 +675,12 @@ export class MemoryManager {
         if (currentHash !== storedHash) {
           throw new Error(`Stored chunk integrity check failed for ID: ${chunkId}`);
         }
+      }
+      // Honour the governance lifecycle: a deleted (or expired) chunk is not a
+      // valid read target, even by direct id. Redacted chunks are returned as
+      // their sanitized tombstone (content already replaced on disk).
+      if (!isRetrievable(chunk)) {
+        throw new Error(`Chunk ${chunkId} is not retrievable (deleted or expired)`);
       }
       return chunk;
     } catch (error) {
@@ -849,6 +859,7 @@ export class MemoryManager {
     let matched = 0;
     let changed = 0;
     const affected: ReceiptAffectedRecord[] = [];
+    const mutatedChunks: Chunk[] = [];
 
     for (const bucket of this.rootBuckets.values()) {
       for (const chunk of bucket.getAllChunks(true, true)) {
@@ -858,6 +869,7 @@ export class MemoryManager {
         const updated = chunkMutator(chunk);
         if (bucket.updateChunk(updated, true)) {
           changed++;
+          mutatedChunks.push(updated);
           affected.push({ id: chunk.id, type: 'chunk', beforeHash, afterHash: hashContent(updated.content) });
         }
       }
@@ -885,10 +897,72 @@ export class MemoryManager {
 
     if (changed > 0) {
       this.recordGovernanceReceipt(operation, matched, changed, affected, reason);
+      // Durably overwrite each mutated chunk's on-disk blob so the original
+      // content cannot be resurrected on restart — making the operation the
+      // governance receipt attests actually permanent. Runs on the same
+      // background queue as the manifest (drained by shutdown), in order, so the
+      // manifest captures any location change from the rewrite.
+      for (const chunk of mutatedChunks) {
+        this.enqueueBackgroundWrite(() => this.persistChunkMutation(chunk));
+      }
       this.persistManifestInBackground();
     }
 
     return { matched, changed };
+  }
+
+  /**
+   * Overwrite a mutated (redacted/deleted) chunk's stored blob so the erasure is
+   * durable. Prefers an in-place provider update; otherwise stores the sanitized
+   * blob and removes the original so pre-mutation content never outlives the op.
+   */
+  private async persistChunkMutation(chunk: Chunk): Promise<void> {
+    const location = this.chunkLocations.get(chunk.id);
+    if (!location) {
+      return;
+    }
+
+    const provider = this.storageProviders.get(location.providerId);
+    if (!provider || !(await provider.isConnected())) {
+      return;
+    }
+
+    chunk.metadata.hash = await this.calculateChunkHash(chunk);
+    const serialized = Buffer.from(JSON.stringify(chunk));
+
+    if (typeof provider.update === 'function') {
+      const updated = await provider.update(location, serialized, chunk.metadata);
+      this.chunkLocations.set(chunk.id, updated);
+      return;
+    }
+
+    // Fallback for providers without in-place update: write the sanitized blob
+    // first, repoint the location, then delete the original so a crash mid-way
+    // never loses the tombstone while still erasing the original content.
+    const newLocation = await provider.store(serialized, chunk.metadata);
+    this.chunkLocations.set(chunk.id, newLocation);
+    if (newLocation.key !== location.key || newLocation.providerId !== location.providerId) {
+      try {
+        await provider.delete(location);
+      } catch (error) {
+        console.warn(`Failed to remove pre-mutation chunk blob ${chunk.id}: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Append a write onto the same serialized background queue used for the
+   * manifest, so ordering is preserved and shutdown() drains it before exit.
+   */
+  private enqueueBackgroundWrite(task: () => Promise<void>): void {
+    if (this.isShutdown) {
+      return;
+    }
+    this.manifestSaveQueue = this.manifestSaveQueue
+      .then(task)
+      .catch(error => {
+        console.warn(`Failed background write: ${error}`);
+      });
   }
 
   /**
