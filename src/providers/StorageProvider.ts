@@ -45,7 +45,21 @@ export interface StorageProvider {
    * @returns A location that can be used to retrieve the data
    */
   store(data: Buffer | string, metadata?: Record<string, unknown>): Promise<ChunkLocation>;
-  
+
+  /**
+   * Overwrite the data at an existing location in place, reusing the same key.
+   *
+   * Used by governance operations (redaction/deletion) so the original content
+   * is durably replaced rather than orphaned under a new key. Optional: callers
+   * fall back to delete-then-store when a provider does not implement it.
+   *
+   * @param location - The existing location to overwrite
+   * @param data - The replacement data
+   * @param metadata - Optional metadata to associate with the data
+   * @returns The location of the overwritten data (typically unchanged)
+   */
+  update?(location: ChunkLocation, data: Buffer | string, metadata?: Record<string, unknown>): Promise<ChunkLocation>;
+
   /**
    * Retrieve data from the provider
    * 

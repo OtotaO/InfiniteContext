@@ -214,13 +214,20 @@ export class VectorStore {
    * @returns The internal ID assigned to the chunk
    */
   public addChunk(chunk: Chunk): number {
-    this.adoptDimensionIfNeeded(chunk.embedding);
-    this.validateDimension(chunk.embedding, 'Chunk embedding');
+    // Redacted/deleted tombstones carry an empty embedding by design. Store them
+    // (so lifecycle markers survive a restart) but skip dimension validation and
+    // normalization — search excludes them, so they never need to be scorable.
+    const isTombstone = chunk.embedding.length === 0;
+
+    if (!isTombstone) {
+      this.adoptDimensionIfNeeded(chunk.embedding);
+      this.validateDimension(chunk.embedding, 'Chunk embedding');
+    }
 
     const storedChunk = this.cloneChunk(chunk);
 
     // Make sure the embedding is normalized if using cosine similarity
-    if (this.metric === 'cosine') {
+    if (!isTombstone && this.metric === 'cosine') {
       storedChunk.embedding = this.normalizeVector(storedChunk.embedding);
     }
 
@@ -276,10 +283,16 @@ export class VectorStore {
 
     const now = new Date();
 
-    // Exclude deleted memories, then score by semantic similarity blended with
-    // decayed memory weight.
+    // Exclude deleted and redacted memories (redacted chunks carry an empty
+    // embedding and must never be scored), and defensively skip any chunk whose
+    // embedding dimension does not match the query so one bad vector can never
+    // throw and take down the whole search. Then score by similarity blended
+    // with decayed memory weight.
     const results = this.chunks
-      .filter(chunk => chunk.metadata.deletionStatus !== DeletionStatus.DELETED)
+      .filter(chunk =>
+        chunk.metadata.deletionStatus !== DeletionStatus.DELETED &&
+        chunk.metadata.deletionStatus !== DeletionStatus.REDACTED &&
+        chunk.embedding.length === queryVector.length)
       .map(chunk => ({
         chunk,
         score: this.calculateRetrievalScore(queryVector, chunk, now),

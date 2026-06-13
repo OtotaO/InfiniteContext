@@ -151,8 +151,50 @@ export class LocalStorageProvider implements StorageProvider {
   }
 
   /**
+   * Overwrite the data at an existing key in place.
+   *
+   * Keeps the location stable so the original blob is replaced (not orphaned),
+   * which is what makes redaction/deletion durable on disk.
+   */
+  public async update(location: ChunkLocation, data: Buffer | string, metadata?: Record<string, unknown>): Promise<ChunkLocation> {
+    if (!this.connected) {
+      throw new Error('Provider not connected');
+    }
+
+    if (location.providerId !== this.id) {
+      throw new Error(`Location provider ID ${location.providerId} does not match this provider's ID ${this.id}`);
+    }
+
+    const dataBuffer = typeof data === 'string' ? Buffer.from(data) : data;
+    const filePath = join(this.basePath, location.key);
+
+    // Account for the size delta against the existing blob (0 if it is gone).
+    let previousSize = 0;
+    try {
+      previousSize = (await fs.stat(filePath)).size;
+    } catch {
+      // No existing blob; treat as a fresh write of dataBuffer.length bytes.
+    }
+
+    if (this.currentSizeBytes - previousSize + dataBuffer.length > this.maxSizeBytes) {
+      throw new Error('Not enough space available');
+    }
+
+    await fs.mkdir(dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, dataBuffer);
+
+    if (metadata) {
+      await fs.writeFile(`${filePath}.meta`, JSON.stringify(metadata));
+    }
+
+    this.currentSizeBytes += dataBuffer.length - previousSize;
+
+    return { providerId: this.id, key: location.key };
+  }
+
+  /**
    * Retrieve data from the provider
-   * 
+   *
    * @param location - The location to retrieve data from
    * @returns The retrieved data
    */
