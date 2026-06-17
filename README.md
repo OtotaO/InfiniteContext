@@ -371,7 +371,7 @@ nvm use 18
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/InfiniteContext.git
+git clone https://github.com/OtotaO/InfiniteContext.git
 cd InfiniteContext
 
 # Install dependencies
