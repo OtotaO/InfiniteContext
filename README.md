@@ -24,9 +24,13 @@ InfiniteContext is a TypeScript library that provides a structured way to store,
 
 ## Installation
 
+Not yet published to npm. Install from source:
+
 ```bash
-npm install @ototao/infinite-context
+git clone https://github.com/OtotaO/InfiniteContext.git && cd InfiniteContext && npm install && npm run build
 ```
+
+Once published, `npm install @ototao/infinite-context` will work. Note: the unscoped package `infinite-context` on npm is unrelated to this project.
 
 ## Basic Usage
 
