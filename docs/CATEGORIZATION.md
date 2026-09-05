@@ -23,7 +23,7 @@ The system is designed to be:
 To use the categorization system, you need to initialize it when creating your InfiniteContext instance:
 
 ```typescript
-import { InfiniteContext } from 'infinite-context';
+import { InfiniteContext } from '@ototao/infinite-context';
 import { OpenAI } from 'openai';
 
 // Create an OpenAI client (required for embeddings)

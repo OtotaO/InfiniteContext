@@ -193,7 +193,7 @@ const stats = await context.getMemoryStats();
 Here's an example of how you might use the memory monitoring system to create a simple monitoring dashboard:
 
 ```typescript
-import { InfiniteContext, MemoryAlert } from 'infinite-context';
+import { InfiniteContext, MemoryAlert } from '@ototao/infinite-context';
 
 // Create and initialize the context
 const context = new InfiniteContext({

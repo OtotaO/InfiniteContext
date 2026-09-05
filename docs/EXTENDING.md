@@ -25,7 +25,7 @@ One of the most common ways to extend InfiniteContext is by adding custom storag
 To create a custom storage provider, you need to implement the `StorageProvider` interface:
 
 ```typescript
-import { StorageProvider, StorageTier, StorageQuota, ChunkLocation } from 'infinite-context';
+import { StorageProvider, StorageTier, StorageQuota, ChunkLocation } from '@ototao/infinite-context';
 
 export class CustomStorageProvider implements StorageProvider {
   private id: string;
@@ -163,7 +163,7 @@ export class CustomStorageProvider implements StorageProvider {
 Once you've implemented your custom storage provider, you can register it with the MemoryManager:
 
 ```typescript
-import { InfiniteContext } from 'infinite-context';
+import { InfiniteContext } from '@ototao/infinite-context';
 import { CustomStorageProvider } from './CustomStorageProvider';
 
 const context = new InfiniteContext();
@@ -182,7 +182,7 @@ context.memoryManager.addStorageProvider(customProvider);
 Here's an example of a storage provider that uses Amazon S3:
 
 ```typescript
-import { StorageProvider, StorageTier, StorageQuota, ChunkLocation } from 'infinite-context';
+import { StorageProvider, StorageTier, StorageQuota, ChunkLocation } from '@ototao/infinite-context';
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
 
 export class S3StorageProvider implements StorageProvider {
@@ -375,7 +375,7 @@ The default vector store implementation in InfiniteContext is a simple in-memory
 To create a custom vector store, you can extend the `VectorStore` class or implement a compatible interface:
 
 ```typescript
-import { Chunk, Vector, SearchResult } from 'infinite-context';
+import { Chunk, Vector, SearchResult } from '@ototao/infinite-context';
 
 export class CustomVectorStore {
   private dimension: number;
@@ -477,7 +477,7 @@ export class CustomVectorStore {
 To use your custom vector store with buckets, you can pass it to the bucket constructor:
 
 ```typescript
-import { Bucket, BucketConfig } from 'infinite-context';
+import { Bucket, BucketConfig } from '@ototao/infinite-context';
 import { CustomVectorStore } from './CustomVectorStore';
 
 const bucketConfig: BucketConfig = {
@@ -496,7 +496,7 @@ const bucket = new Bucket(bucketConfig, vectorStore);
 Here's an example of a vector store that uses FAISS (Facebook AI Similarity Search) for efficient similarity search:
 
 ```typescript
-import { Chunk, Vector, SearchResult } from 'infinite-context';
+import { Chunk, Vector, SearchResult } from '@ototao/infinite-context';
 import * as faiss from 'node-faiss';
 
 export class FaissVectorStore {
@@ -589,7 +589,7 @@ InfiniteContext uses embeddings to represent chunks of text in a high-dimensiona
 An embedding function is simply a function that takes a string and returns a vector (array of numbers):
 
 ```typescript
-import { Vector } from 'infinite-context';
+import { Vector } from '@ototao/infinite-context';
 
 export async function customEmbedding(text: string): Promise<Vector> {
   // Implement your embedding logic here
@@ -612,7 +612,7 @@ export async function customEmbedding(text: string): Promise<Vector> {
 To use your custom embedding function, pass it to the InfiniteContext constructor:
 
 ```typescript
-import { InfiniteContext } from 'infinite-context';
+import { InfiniteContext } from '@ototao/infinite-context';
 import { customEmbedding } from './customEmbedding';
 
 const context = new InfiniteContext({
@@ -627,7 +627,7 @@ await context.initialize();
 Here's an example of an embedding function that uses the Sentence Transformers library:
 
 ```typescript
-import { Vector } from 'infinite-context';
+import { Vector } from '@ototao/infinite-context';
 import * as tf from '@tensorflow/tfjs-node';
 import * as use from '@tensorflow-models/universal-sentence-encoder';
 
@@ -658,7 +658,7 @@ InfiniteContext includes a summarization engine that generates summaries of text
 To create a custom summarization engine, you can extend the `SummarizationEngine` class or implement a compatible interface:
 
 ```typescript
-import { ChunkSummary } from 'infinite-context';
+import { ChunkSummary } from '@ototao/infinite-context';
 
 export class CustomSummarizationEngine {
   constructor() {
@@ -720,7 +720,7 @@ export class CustomSummarizationEngine {
 To use your custom summarization engine, you'll need to modify the MemoryManager to use it:
 
 ```typescript
-import { InfiniteContext, MemoryManager } from 'infinite-context';
+import { InfiniteContext, MemoryManager } from '@ototao/infinite-context';
 import { CustomSummarizationEngine } from './CustomSummarizationEngine';
 
 // Create a custom memory manager that uses your summarization engine
@@ -759,7 +759,7 @@ InfiniteContext includes a memory monitoring system that tracks usage across buc
 To create a custom memory monitor, you can extend the `MemoryMonitor` class or implement a compatible interface:
 
 ```typescript
-import { Bucket, StorageProvider, MemoryAlert } from 'infinite-context';
+import { Bucket, StorageProvider, MemoryAlert } from '@ototao/infinite-context';
 
 export class CustomMemoryMonitor {
   private buckets: Map<string, Bucket> = new Map();
@@ -888,7 +888,7 @@ export class CustomMemoryMonitor {
 To use your custom memory monitor, you'll need to modify the MemoryManager to use it:
 
 ```typescript
-import { InfiniteContext, MemoryManager } from 'infinite-context';
+import { InfiniteContext, MemoryManager } from '@ototao/infinite-context';
 import { CustomMemoryMonitor } from './CustomMemoryMonitor';
 
 // Create a custom memory manager that uses your memory monitor
@@ -953,7 +953,7 @@ InfiniteContext includes a robust error handling system that provides detailed e
 To create a custom error handler, you can implement the `ErrorHandler` interface:
 
 ```typescript
-import { ErrorHandler, ErrorType, ErrorContext, ErrorOptions } from 'infinite-context';
+import { ErrorHandler, ErrorType, ErrorContext, ErrorOptions } from '@ototao/infinite-context';
 
 export class CustomErrorHandler implements ErrorHandler {
   private errorListeners: Array<(error: Error, context?: ErrorContext) => void> = [];
